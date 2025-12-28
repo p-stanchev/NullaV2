@@ -353,6 +353,94 @@ impl NullaDb {
         Ok(total_input)
     }
 
+    /// Verify Ed25519 signatures on all transaction inputs.
+    ///
+    /// For each input (except coinbase):
+    /// 1. Looks up the previous output from UTXO set
+    /// 2. Extracts the address from the script_pubkey
+    /// 3. Hashes the public key from the input and verifies it matches the address
+    /// 4. Verifies the Ed25519 signature using the public key
+    ///
+    /// Returns Ok(()) if all signatures are valid, Err otherwise.
+    pub fn verify_tx_signatures(&self, tx: &nulla_core::Tx) -> Result<()> {
+        // Skip coinbase transactions
+        if nulla_core::is_coinbase(tx) {
+            return Ok(());
+        }
+
+        for input in &tx.inputs {
+            // Get the previous output being spent
+            let prev_output = match self.get_utxo(&input.prevout)? {
+                Some(output) => output,
+                None => {
+                    return Err(DbError::Serde(bincode::Error::new(
+                        bincode::ErrorKind::Custom("UTXO not found for signature verification".to_string()),
+                    )));
+                }
+            };
+
+            // Extract address from the previous output's script_pubkey
+            let expected_addr_bytes = match extract_address_bytes(&prev_output.script_pubkey) {
+                Some(addr) => addr,
+                None => {
+                    return Err(DbError::Serde(bincode::Error::new(
+                        bincode::ErrorKind::Custom("Invalid script_pubkey format".to_string()),
+                    )));
+                }
+            };
+
+            // Parse public key from input (32 bytes for Ed25519)
+            if input.pubkey.len() != 32 {
+                return Err(DbError::Serde(bincode::Error::new(
+                    bincode::ErrorKind::Custom("Invalid public key length".to_string()),
+                )));
+            }
+
+            let pubkey_bytes: [u8; 32] = input.pubkey[..32].try_into().unwrap();
+            let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes) {
+                Ok(key) => key,
+                Err(_) => {
+                    return Err(DbError::Serde(bincode::Error::new(
+                        bincode::ErrorKind::Custom("Invalid Ed25519 public key".to_string()),
+                    )));
+                }
+            };
+
+            // Hash the public key to get the address
+            let pubkey_hash = blake3::hash(&input.pubkey);
+            let actual_addr_bytes = &pubkey_hash.as_bytes()[0..20];
+
+            // Verify the public key hashes to the expected address
+            if actual_addr_bytes != expected_addr_bytes.as_slice() {
+                return Err(DbError::Serde(bincode::Error::new(
+                    bincode::ErrorKind::Custom("Public key does not match address".to_string()),
+                )));
+            }
+
+            // Parse signature (64 bytes for Ed25519)
+            if input.sig.len() != 64 {
+                return Err(DbError::Serde(bincode::Error::new(
+                    bincode::ErrorKind::Custom("Invalid signature length".to_string()),
+                )));
+            }
+
+            let sig_bytes: [u8; 64] = input.sig[..64].try_into().unwrap();
+            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+            // Serialize transaction for verification
+            let tx_data = bincode::serialize(tx)?;
+
+            // Verify the signature
+            if verifying_key.verify_strict(&tx_data, &signature).is_err() {
+                return Err(DbError::Serde(bincode::Error::new(
+                    bincode::ErrorKind::Custom("Signature verification failed".to_string()),
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Apply a transaction to the UTXO set (mark inputs as spent, create new outputs).
     pub fn apply_tx(&self, tx: &nulla_core::Tx) -> Result<()> {
         let txid = nulla_core::tx_id(tx);

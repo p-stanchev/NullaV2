@@ -15,3 +15,5 @@ bytes.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true

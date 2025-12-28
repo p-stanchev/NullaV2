@@ -482,7 +482,34 @@ async fn handle_network_events(
 
                 // Validate the block structure
                 if let Err(e) = nulla_core::validate_block(&block) {
-                    warn!("received invalid block: {e}");
+                    warn!("received invalid block (structure): {e}");
+                    continue;
+                }
+
+                // Verify signatures on all transactions (except coinbase)
+                let mut block_valid = true;
+                for (i, tx) in block.txs.iter().enumerate() {
+                    if let Err(e) = db.verify_tx_signatures(tx) {
+                        warn!("block rejected: transaction {i} has invalid signature: {e}");
+                        block_valid = false;
+                        break;
+                    }
+                }
+                if !block_valid {
+                    continue;
+                }
+
+                // Validate UTXO inputs for all transactions (except coinbase)
+                for (i, tx) in block.txs.iter().enumerate() {
+                    if !nulla_core::is_coinbase(tx) {
+                        if let Err(e) = db.validate_tx_inputs(tx) {
+                            warn!("block rejected: transaction {i} has invalid inputs: {e}");
+                            block_valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !block_valid {
                     continue;
                 }
 
@@ -775,6 +802,7 @@ fn spawn_seed(
                     inputs: vec![nulla_core::TxIn {
                         prevout: nulla_core::OutPoint::null(),
                         sig: next_height.to_le_bytes().to_vec(),
+                        pubkey: vec![], // Coinbase doesn't need a public key
                     }],
                     outputs: vec![nulla_core::TxOut {
                         value_atoms: nulla_wallet::BLOCK_REWARD_ATOMS,

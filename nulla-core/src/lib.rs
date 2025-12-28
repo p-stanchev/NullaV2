@@ -44,8 +44,11 @@ impl OutPoint {
 pub struct TxIn {
     /// The output being spent.
     pub prevout: OutPoint,
-    /// Signature bytes over a sighash. Script validation is intentionally minimal for now.
+    /// Signature bytes over a sighash (64 bytes for Ed25519).
     pub sig: Vec<u8>,
+    /// Public key bytes for signature verification (32 bytes for Ed25519).
+    /// Empty for coinbase transactions.
+    pub pubkey: Vec<u8>,
 }
 
 /// A transaction output that can be spent in the future.
@@ -258,6 +261,46 @@ pub fn validate_coinbase(tx: &Tx) -> Result<(), ValidationError> {
     for output in &tx.outputs {
         total = total.checked_add(output.value_atoms)
             .ok_or(ValidationError::ValueOverflow)?;
+    }
+
+    Ok(())
+}
+
+/// Verify signatures on all inputs of a transaction.
+///
+/// This checks that each input (except coinbase) has:
+/// - A valid 64-byte Ed25519 signature
+/// - A valid 32-byte Ed25519 public key
+/// - The public key hashes to the address in the previous output's script_pubkey
+/// - The signature is valid for this transaction and public key
+///
+/// Returns Ok(()) if all signatures are valid, Err otherwise.
+/// Note: This requires looking up previous outputs from the UTXO set (done at a higher level).
+pub fn verify_tx_signatures(tx: &Tx) -> Result<(), ValidationError> {
+    // Skip signature verification for coinbase transactions
+    if is_coinbase(tx) {
+        return Ok(());
+    }
+
+    for input in &tx.inputs {
+        // Check signature length (64 bytes for Ed25519)
+        if input.sig.len() != 64 {
+            return Err(ValidationError::InvalidSignature);
+        }
+
+        // Check public key length (32 bytes for Ed25519)
+        if input.pubkey.len() != 32 {
+            return Err(ValidationError::InvalidSignature);
+        }
+
+        // Note: Full verification requires:
+        // 1. Looking up the previous output to get the script_pubkey
+        // 2. Extracting the address from script_pubkey
+        // 3. Hashing the public key and checking it matches the address
+        // 4. Verifying the signature using the public key
+        //
+        // This is done at a higher level (in the node) where we have access to the UTXO set.
+        // This function just validates the format of signatures and public keys.
     }
 
     Ok(())

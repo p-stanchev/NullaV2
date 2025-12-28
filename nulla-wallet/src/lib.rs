@@ -204,10 +204,13 @@ impl Wallet {
             lock_time,
         };
 
-        // Sign each input with the wallet's keypair.
+        // Sign each input with the wallet's keypair and add the public key.
         let signature = self.keypair.sign_transaction(&tx)?;
+        let pubkey_bytes = self.keypair.public_key().to_bytes().to_vec();
+
         for input in &mut tx.inputs {
             input.sig = signature.clone();
+            input.pubkey = pubkey_bytes.clone();
         }
 
         Ok(tx)
@@ -250,6 +253,8 @@ pub fn create_coinbase(recipient: &Address, block_height: u64, reward_atoms: u64
             },
             // Encode block height in the signature field for uniqueness (like Bitcoin's coinbase script)
             sig: block_height.to_le_bytes().to_vec(),
+            // Coinbase doesn't need a public key
+            pubkey: vec![],
         }],
         outputs: vec![TxOut {
             value_atoms: reward_atoms,
