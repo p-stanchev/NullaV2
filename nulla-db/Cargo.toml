@@ -1,0 +1,17 @@
+[package]
+name = "nulla-db"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+nulla-core = { path = "../nulla-core" }
+sled.workspace = true
+serde.workspace = true
+bincode.workspace = true
+postcard.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

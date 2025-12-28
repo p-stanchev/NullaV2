@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Debug symbols
+**/*.pdb
+
+# Cargo.lock for libraries (uncomment if this is a binary)
+# Cargo.lock
+
+# Environment files
+.env
+.env.local
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.claude/
+
+# Database and node data
+/data/
+/data2/
+**/data/
+*.db
+*.sled/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+tmp/
+
+# Production readiness assessment (internal doc)
+PRODUCTION_READINESS.md
