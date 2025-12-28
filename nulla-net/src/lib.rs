@@ -357,6 +357,12 @@ pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError>
             .map_err(|e| anyhow::anyhow!("dial error: {e}"))?;
     }
 
+    // Bootstrap Kademlia DHT if we have initial peers
+    if !config.peers.is_empty() {
+        info!("bootstrapping Kademlia DHT with {} initial peer(s)", config.peers.len());
+        let _ = swarm.behaviour_mut().kad.bootstrap();
+    }
+
     let (cmd_tx, cmd_rx) = async_channel::bounded(64);
     let (evt_tx, evt_rx) = async_channel::bounded(1024);
     tokio::spawn(async move {
@@ -511,10 +517,36 @@ async fn handle_swarm_event(
                     }
                 }
             }
-            BehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, .. }) => {
-                let _ = evt_tx.send(NetworkEvent::PeerConnected(peer)).await;
+            BehaviourEvent::Kad(kad_event) => match kad_event {
+                kad::Event::RoutingUpdated { peer, .. } => {
+                    info!("kad: routing updated with peer {peer}");
+                    let _ = evt_tx.send(NetworkEvent::PeerConnected(peer)).await;
+                }
+                kad::Event::OutboundQueryProgressed { result, .. } => {
+                    match result {
+                        kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                            info!("kad: discovered {} peers via GetClosestPeers", ok.peers.len());
+                            for peer_info in ok.peers {
+                                let _ = evt_tx.send(NetworkEvent::PeerConnected(peer_info.peer_id)).await;
+                            }
+                        }
+                        kad::QueryResult::Bootstrap(Ok(ok)) => {
+                            info!("kad: bootstrap succeeded, {} peers in routing table", ok.num_remaining);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            },
+            BehaviourEvent::Identify(identify_event) => {
+                if let identify::Event::Received { peer_id, info, .. } = identify_event {
+                    info!("identify: received from {peer_id}, listen addrs: {}", info.listen_addrs.len());
+                    // When we identify a peer, add it to Kademlia DHT
+                    for addr in info.listen_addrs {
+                        info!("identify: peer {peer_id} listening on {addr}");
+                    }
+                }
             }
-            _ => {}
         },
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             let _ = evt_tx.send(NetworkEvent::PeerDisconnected(peer_id)).await;
