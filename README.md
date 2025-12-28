@@ -87,8 +87,15 @@ The nodes will connect, exchange peer information, and gossip blocks/transaction
 To create blocks that properly build a chain (with incrementing height):
 
 ```bash
-cargo run -p nulla-node -- --listen /ip4/0.0.0.0/tcp/27444 --seed
+# Secure method (recommended): Use --miner-address to receive rewards without exposing private key
+cargo run -p nulla-node -- --listen /ip4/0.0.0.0/tcp/27444 --seed --miner-address 79bc6374ccc99f1211770ce007e05f6235b98c8b
+
+# Alternative (less secure): Use --wallet-seed if you need to sign transactions
+# WARNING: This exposes your private key in process lists!
+cargo run -p nulla-node -- --listen /ip4/0.0.0.0/tcp/27444 --seed --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094
 ```
+
+**Security Best Practice:** Always use `--miner-address` for mining/seed nodes instead of `--wallet-seed`. The miner address is your public address and safe to expose, while the wallet seed is your private key and should be kept secret.
 
 The seed node:
 - Reads the current best tip from the database
@@ -97,6 +104,7 @@ The seed node:
 - Does NOT perform proof-of-work (uses easy target for testing)
 - Broadcasts blocks to all connected peers
 - Shows a **progress bar** when syncing blocks from other nodes
+- Sends block rewards to the specified miner address
 
 ### Enabling the Stub Miner
 
@@ -162,12 +170,22 @@ The balance will show coinbase rewards earned by running as a seed node.
 
 #### Using a Wallet with a Running Node
 
-Load a wallet when starting the node:
+**For Mining (Recommended - Secure):**
 ```bash
+# Use --miner-address to receive block rewards WITHOUT exposing your private key
+cargo run -p nulla-node -- --seed --miner-address 79bc6374ccc99f1211770ce007e05f6235b98c8b --listen /ip4/0.0.0.0/tcp/27444
+```
+
+**For Transaction Signing (Use with Caution):**
+```bash
+# WARNING: This exposes your private key in process lists!
+# Only use --wallet-seed when you need to sign transactions, NOT for mining
 cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --listen /ip4/0.0.0.0/tcp/27444
 ```
 
-The node will log: `wallet loaded, address: 79bc6374ccc99f1211770ce007e05f6235b98c8b`
+The node will log:
+- With `--miner-address`: `miner address loaded: 79bc6374ccc99f1211770ce007e05f6235b98c8b`
+- With `--wallet-seed`: `wallet loaded, address: 79bc6374ccc99f1211770ce007e05f6235b98c8b`
 
 ### Running on a VPS
 
@@ -178,11 +196,14 @@ To run a public seed node on a VPS that others can connect to:
 # Build in release mode for better performance
 cargo build --release
 
-# Run the node, listening on all interfaces
+# Run a basic node (no rewards)
 ./target/release/nulla --listen /ip4/0.0.0.0/tcp/27444
 
-# With mining enabled
-./target/release/nulla --listen /ip4/0.0.0.0/tcp/27444 --mine
+# Run with seed mode and receive block rewards securely
+./target/release/nulla --listen /ip4/0.0.0.0/tcp/27444 --seed --miner-address YOUR_ADDRESS_HERE
+
+# WARNING: Never expose wallet seeds on public VPS!
+# NEVER DO THIS: ./target/release/nulla --wallet-seed YOUR_PRIVATE_KEY  # INSECURE!
 ```
 
 **On your local machine (connecting to VPS):**
@@ -212,6 +233,43 @@ sudo ufw allow 27444/tcp
 sudo ufw reload
 ```
 
+## Security Best Practices
+
+### Mining and Block Rewards
+
+**IMPORTANT:** Nulla provides two ways to receive block rewards, but only one is secure for production use:
+
+✅ **SECURE - Use `--miner-address`:**
+```bash
+# Generate a wallet once to get your address
+cargo run -p nulla-node -- --generate-wallet
+
+# Copy the address (40-char hex) and use it for mining
+cargo run -p nulla-node -- --seed --miner-address 79bc6374ccc99f1211770ce007e05f6235b98c8b
+```
+
+**Why this is secure:**
+- Your **address is public information** - it's safe to expose
+- Your **private key stays offline** and secure
+- Even if your VPS is compromised, attackers can't steal your private key
+- You can later spend your rewards by signing transactions offline
+
+❌ **INSECURE - Avoid `--wallet-seed` for mining:**
+```bash
+# DON'T DO THIS on production nodes!
+cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
+```
+
+**Why this is insecure:**
+- Private keys appear in process lists (visible to all users via `ps` command)
+- Private keys may be logged to system logs or crash dumps
+- If your node is compromised, attackers get your private key immediately
+- No way to rotate keys without losing access to past rewards
+
+**Rule of thumb:**
+- Use `--miner-address` for receiving rewards (mining/seed nodes)
+- Only use `--wallet-seed` for transaction signing on secure, offline machines
+
 ## Command-Line Options
 
 ### Network Configuration
@@ -237,14 +295,14 @@ sudo ufw reload
 ### Wallet
 
 - `--generate-wallet`: Generate a new wallet and print address and seed
-- `--wallet-seed <HEX>`: Load wallet from 32-byte hex seed
+- `--wallet-seed <HEX>`: Load wallet from 32-byte hex seed (use for transaction signing only, NOT for mining)
+- `--miner-address <HEX>`: Miner payout address for block rewards (40-char hex, 20 bytes) - SECURE for mining
 - `--get-address`: Display wallet address (requires `--wallet-seed`)
 - `--get-balance`: Display wallet balance and UTXOs (requires `--wallet-seed` and `--db`)
 
 ### Placeholders (Not Yet Implemented)
 
 - `--rpc <ADDR>`: RPC server bind address (default: `127.0.0.1:27447`)
-- `--miner-address <ADDR>`: Miner payout address for coinbase transactions
 - `--socks5 <ADDR>`: SOCKS5 proxy address for network connections
 
 ## Development Status
@@ -282,6 +340,8 @@ sudo ufw reload
 - [x] Ed25519 signature verification infrastructure
 - [x] UTXO indexing by address (O(1) balance lookups)
 - [x] Working wallet balance checker with UTXO details
+- [x] Secure mining with public addresses (--miner-address flag)
+- [x] Separation of mining rewards from transaction signing
 
 ### In Progress 🚧
 - [ ] Wire up signature verification when processing blocks

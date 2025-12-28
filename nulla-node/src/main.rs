@@ -64,7 +64,9 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:27447")]
     rpc: String,
 
-    /// Miner payout address (placeholder for future coinbase construction).
+    /// Miner payout address for block rewards (40-char hex, 20 bytes).
+    /// Use this instead of --wallet-seed for mining to avoid exposing private keys.
+    /// Example: --miner-address 79bc6374ccc99f1211770ce007e05f6235b98c8b
     #[arg(long)]
     miner_address: Option<String>,
 
@@ -77,6 +79,8 @@ struct Args {
     generate_wallet: bool,
 
     /// Wallet seed (32 bytes hex) to use for signing transactions.
+    /// WARNING: Only use for transaction signing, NOT for mining!
+    /// For mining, use --miner-address instead to avoid exposing your private key.
     #[arg(long)]
     wallet_seed: Option<String>,
 
@@ -199,6 +203,22 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Parse miner address if provided (for receiving block rewards without exposing private key).
+    let miner_address = if let Some(addr_hex) = &args.miner_address {
+        match nulla_wallet::Address::from_hex(addr_hex) {
+            Some(addr) => {
+                info!("miner address loaded: {}", addr);
+                Some(addr)
+            }
+            None => {
+                warn!("invalid miner address (must be 40-char hex, 20 bytes), ignoring");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Open the database for blocks, headers, UTXOs, and mempool.
     let db = NullaDb::open(&args.db)?;
 
@@ -243,10 +263,13 @@ async fn main() -> Result<()> {
 
         // If seed mode is enabled, spawn the seed block builder.
         if args.seed {
-            if wallet.is_none() {
-                warn!("seed mode enabled but no wallet provided; use --wallet-seed to receive block rewards");
+            // Determine coinbase address (prefer miner_address for security)
+            let coinbase_addr = miner_address.or_else(|| wallet.as_ref().map(|w| w.address()));
+
+            if coinbase_addr.is_none() {
+                warn!("seed mode enabled but no address provided; use --miner-address or --wallet-seed to receive block rewards");
             }
-            spawn_seed(chain_id, cmd_tx, db.clone(), handle.local_peer_id, wallet.clone())?;
+            spawn_seed(chain_id, cmd_tx, db.clone(), handle.local_peer_id, coinbase_addr)?;
         }
     } else {
         info!("gossip stack disabled; node running in local-only mode");
@@ -655,23 +678,17 @@ fn spawn_seed(
     cmd_tx: async_channel::Sender<NetworkCommand>,
     db: NullaDb,
     local_peer_id: libp2p::PeerId,
-    wallet: Option<Wallet>,
+    coinbase_addr: Option<nulla_wallet::Address>,
 ) -> Result<()> {
     tokio::spawn(async move {
         info!("seed node started (peer_id: {local_peer_id})");
 
-        // Get coinbase recipient address
-        let coinbase_addr = match &wallet {
-            Some(w) => {
-                let addr = w.address();
-                info!("seed: coinbase rewards will be sent to {}", addr);
-                Some(addr)
-            }
-            None => {
-                warn!("seed: no wallet, blocks will have no coinbase rewards");
-                None
-            }
-        };
+        // Log coinbase recipient address
+        if let Some(addr) = coinbase_addr {
+            info!("seed: coinbase rewards will be sent to {}", addr);
+        } else {
+            warn!("seed: no address provided, blocks will have dummy coinbase (no real rewards)");
+        }
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
