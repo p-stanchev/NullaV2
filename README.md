@@ -339,6 +339,30 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - `--rpc <ADDR>`: RPC server bind address (default: `127.0.0.1:27447`)
 - `--socks5 <ADDR>`: SOCKS5 proxy address for network connections
 
+## Production Readiness Assessment
+
+### Current Status: ~75% Complete ⚠️
+
+**What Works:**
+- ✅ Full blockchain sync across multiple nodes
+- ✅ Block production and gossip protocol
+- ✅ UTXO state management and indexing
+- ✅ Wallet generation and balance checking
+- ✅ Secure mining with public addresses
+- ✅ P2P networking with automatic peer discovery
+- ✅ Merkle trees and PoW validation
+- ✅ Coinbase transactions and block rewards
+
+**What's Missing (CRITICAL):**
+- ❌ Signature verification on incoming transactions
+- ❌ UTXO validation when accepting blocks
+- ❌ Transaction fees and spam prevention
+- ❌ Dynamic difficulty adjustment
+
+**Security Risk:** Current implementation accepts ANY block and transaction without verifying signatures or checking UTXO validity. This works for testing but **NOT safe for production**.
+
+**Estimated Time to Launch:** 4 critical features remaining, ~1-2 weeks of focused development.
+
 ## Development Status
 
 ### Implemented ✅
@@ -379,13 +403,44 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - [x] Public balance checking (--balance flag works with any address, no private key needed)
 - [x] Blockchain transparency (anyone can query any address balance)
 
-### In Progress 🚧
-- [ ] Wire up signature verification when processing blocks
-- [ ] Wire up UTXO validation when accepting blocks
+### Launch Blockers 🚨 (Must Have for Production)
+- [ ] **Wire up signature verification when processing blocks** (CRITICAL - security hole!)
+- [ ] **Wire up UTXO validation when accepting blocks** (CRITICAL - prevents double-spending)
+- [ ] **Transaction fees and fee validation** (prevents spam attacks)
+- [ ] **Difficulty adjustment algorithm** (required for real PoW security)
+
+### Nice to Have (Can Launch Without)
 - [ ] Fork resolution and reorganization (helpers exist, needs wiring)
-- [ ] Difficulty adjustment algorithm
-- [ ] Full script execution
-- [ ] Transaction fees and fee validation
+- [ ] Full script execution (simplified P2PKH works for now)
+- [ ] Persistent wallet files (current CLI approach works, but could be better)
+- [ ] Transaction mempool broadcasting (nodes can create txs locally)
+- [ ] Wallet encryption and key management improvements
+
+### Future Improvements 💡
+
+**Persistent Wallet Proposal:**
+Current approach requires passing `--wallet-seed` or `--miner-address` on every invocation. A better UX would be:
+
+```bash
+# One-time wallet initialization (creates encrypted wallet.dat)
+nulla --init-wallet
+# Enter password: ****
+# Wallet created: ~/.nulla/wallet.dat
+# Address: 79bc6374ccc99f1211770ce007e05f6235b98c8b
+
+# Future launches use wallet automatically
+nulla --seed --listen /ip4/0.0.0.0/tcp/27444
+# Enter wallet password: ****
+# Mining to: 79bc6374ccc99f1211770ce007e05f6235b98c8b
+```
+
+Benefits:
+- ✅ No private key in command line (more secure)
+- ✅ Simpler UX (no copy/paste seeds)
+- ✅ Aligns with Bitcoin Core / Ethereum clients
+- ✅ Can still use `--miner-address` for flexibility
+
+This is a nice-to-have improvement but NOT required for launch.
 
 ### Planned 📋
 
