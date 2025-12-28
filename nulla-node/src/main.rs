@@ -89,8 +89,15 @@ struct Args {
     get_address: bool,
 
     /// Get wallet balance (requires --wallet-seed and --db).
+    /// DEPRECATED: Use --balance <ADDRESS> instead.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     get_balance: bool,
+
+    /// Check balance for any address (40-char hex, 20 bytes).
+    /// Example: --balance 79bc6374ccc99f1211770ce007e05f6235b98c8b
+    /// Works with any address - check your own balance or someone else's.
+    #[arg(long)]
+    balance: Option<String>,
 }
 
 #[tokio::main]
@@ -177,6 +184,43 @@ async fn main() -> Result<()> {
         } else {
             eprintln!("Error: --wallet-seed required for --get-balance");
             std::process::exit(1);
+        }
+    }
+
+    // Handle balance check command (new, better version - works with any address).
+    if let Some(addr_hex) = &args.balance {
+        match nulla_wallet::Address::from_hex(addr_hex) {
+            Some(address) => {
+                let db = NullaDb::open(&args.db)?;
+
+                // Fetch UTXOs from the address index
+                let utxos = db.get_utxos_by_address(&address.0)?;
+                let balance_atoms: u64 = utxos.iter().map(|(_, txout)| txout.value_atoms).sum();
+                let utxo_count = utxos.len();
+
+                println!("\n=== Address Balance ===");
+                println!("Address: {}", address);
+                println!("Balance: {} NULLA ({} atoms)", nulla_wallet::atoms_to_nulla(balance_atoms), balance_atoms);
+                println!("UTXOs:   {}", utxo_count);
+
+                if !utxos.is_empty() {
+                    println!("\nUTXO Details:");
+                    for (outpoint, txout) in utxos {
+                        println!("  {} vout:{} = {} atoms",
+                            hex::encode(&outpoint.txid[..8]),
+                            outpoint.vout,
+                            txout.value_atoms
+                        );
+                    }
+                }
+
+                return Ok(());
+            }
+            None => {
+                eprintln!("Error: Invalid address (must be 40-char hex, 20 bytes)");
+                eprintln!("Example: nulla --balance 79bc6374ccc99f1211770ce007e05f6235b98c8b");
+                std::process::exit(1);
+            }
         }
     }
 

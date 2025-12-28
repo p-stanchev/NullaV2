@@ -151,22 +151,39 @@ Output:
 79bc6374ccc99f1211770ce007e05f6235b98c8b
 ```
 
-#### Check Wallet Balance
+#### Check Address Balance
 
-Display the balance and UTXOs for a wallet:
+**NEW - Recommended method (works with any address):**
 ```bash
-cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --get-balance --db ./data
+# Check your own balance (no private key needed!)
+cargo run -p nulla-node -- --balance 79bc6374ccc99f1211770ce007e05f6235b98c8b
+
+# Check someone else's balance (blockchain is public!)
+cargo run -p nulla-node -- --balance THEIR_ADDRESS_HERE
 ```
 
 Output:
 ```
-=== Wallet Balance ===
+=== Address Balance ===
 Address: 79bc6374ccc99f1211770ce007e05f6235b98c8b
-Balance: 0.00000000 NULLA (0 atoms)
-UTXOs:   0
+Balance: 16.00000000 NULLA (1600000000 atoms)
+UTXOs:   2
 
-The balance will show coinbase rewards earned by running as a seed node.
+UTXO Details:
+  a1b2c3d4e5f6g7h8 vout:0 = 800000000 atoms
+  9f8e7d6c5b4a3210 vout:0 = 800000000 atoms
 ```
+
+**Old method (DEPRECATED - requires private key):**
+```bash
+cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --get-balance --db ./data
+```
+
+**Why use `--balance` instead of `--get-balance`:**
+- ✅ No private key needed (read-only operation)
+- ✅ Works with any address (check others' balances too)
+- ✅ Simpler - just provide the address
+- ✅ Safe - can't accidentally expose wallet seed
 
 #### Using a Wallet with a Running Node
 
@@ -270,6 +287,22 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - Use `--miner-address` for receiving rewards (mining/seed nodes)
 - Only use `--wallet-seed` for transaction signing on secure, offline machines
 
+### Blockchain Transparency
+
+**Important:** Like Bitcoin and Ethereum, Nulla's blockchain is completely **public and transparent**:
+
+✅ **Anyone can:**
+- View all addresses and their balances using `--balance <ADDRESS>`
+- See all transactions in blocks
+- Track the flow of NULLA between addresses
+- Monitor network activity and block production
+
+🔒 **What's private:**
+- Your **wallet seed** (private key) - never share this
+- The connection between your identity and your address (if you don't tell anyone)
+
+**Privacy tip:** Generate a new address for each transaction using `--generate-wallet` to make tracking harder. The blockchain shows addresses and amounts, but doesn't inherently know which addresses belong to whom.
+
 ## Command-Line Options
 
 ### Network Configuration
@@ -298,7 +331,8 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - `--wallet-seed <HEX>`: Load wallet from 32-byte hex seed (use for transaction signing only, NOT for mining)
 - `--miner-address <HEX>`: Miner payout address for block rewards (40-char hex, 20 bytes) - SECURE for mining
 - `--get-address`: Display wallet address (requires `--wallet-seed`)
-- `--get-balance`: Display wallet balance and UTXOs (requires `--wallet-seed` and `--db`)
+- `--balance <ADDRESS>`: Check balance for any address (40-char hex, 20 bytes) - Works with any address, no private key needed
+- `--get-balance`: Display wallet balance (DEPRECATED - requires `--wallet-seed` and `--db`, use `--balance` instead)
 
 ### Placeholders (Not Yet Implemented)
 
@@ -342,6 +376,8 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - [x] Working wallet balance checker with UTXO details
 - [x] Secure mining with public addresses (--miner-address flag)
 - [x] Separation of mining rewards from transaction signing
+- [x] Public balance checking (--balance flag works with any address, no private key needed)
+- [x] Blockchain transparency (anyone can query any address balance)
 
 ### In Progress 🚧
 - [ ] Wire up signature verification when processing blocks
