@@ -2358,6 +2358,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-trait",
+ "bincode",
  "bytes",
  "futures",
  "libp2p",

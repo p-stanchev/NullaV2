@@ -1,9 +1,9 @@
 //! libp2p NetworkBehaviour composition and configuration.
 
 use libp2p::{
-    gossipsub, identify, identity, kad, ping, request_response, swarm::NetworkBehaviour, PeerId,
+    gossipsub, identify, identity, kad, ping, request_response, swarm::NetworkBehaviour,
+    swarm::StreamProtocol, PeerId,
 };
-use libp2p_swarm::StreamProtocol;
 use std::io;
 
 use crate::{protocol, reqresp};

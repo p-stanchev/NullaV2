@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::request_response;
-use libp2p_swarm::StreamProtocol;
+use libp2p::swarm::StreamProtocol;
 use std::io;
 
 use crate::protocol;
