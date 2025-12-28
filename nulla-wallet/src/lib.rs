@@ -6,7 +6,7 @@
 //! - Transaction signing
 //! - UTXO management for wallet balances
 
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use nulla_core::{OutPoint, Tx, TxIn, TxOut};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -257,6 +257,57 @@ pub fn create_coinbase(recipient: &Address, block_height: u64, reward_atoms: u64
         }],
         lock_time: 0,
     }
+}
+
+/// Verify an Ed25519 signature on a transaction.
+///
+/// Returns Ok(()) if the signature is valid, Err otherwise.
+pub fn verify_signature(tx: &Tx, signature_bytes: &[u8], public_key: &VerifyingKey) -> Result<()> {
+    // Parse the signature (64 bytes for Ed25519)
+    if signature_bytes.len() != 64 {
+        return Err(WalletError::InvalidSignature);
+    }
+
+    let signature = Signature::from_bytes(
+        signature_bytes
+            .try_into()
+            .map_err(|_| WalletError::InvalidSignature)?,
+    );
+
+    // Serialize transaction for verification (same as signing)
+    let tx_data = bincode::serialize(tx)?;
+
+    // Verify the signature
+    public_key
+        .verify(&tx_data, &signature)
+        .map_err(|_| WalletError::InvalidSignature)
+}
+
+/// Extract public key from a script_pubkey (P2PKH-like format).
+///
+/// Returns None if the script is not in the expected format.
+/// Format: [OP_DUP, OP_HASH160, <20-byte address>, OP_EQUALVERIFY, OP_CHECKSIG]
+///
+/// Note: This is a simplified version. A full implementation would actually
+/// execute the script and verify the signature. For now, we just extract
+/// the address and verify signatures separately.
+pub fn extract_address_from_script(script_pubkey: &[u8]) -> Option<Address> {
+    if script_pubkey.len() != 25 {
+        return None;
+    }
+
+    if script_pubkey[0] != 0x76
+        || script_pubkey[1] != 0xa9
+        || script_pubkey[2] != 0x14
+        || script_pubkey[23] != 0x88
+        || script_pubkey[24] != 0xac
+    {
+        return None;
+    }
+
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&script_pubkey[3..23]);
+    Some(Address(addr))
 }
 
 #[cfg(test)]
