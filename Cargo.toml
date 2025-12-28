@@ -62,3 +62,6 @@ async-trait = "0.1"
 
 # Time
 chrono = "0.4"
+
+# Progress bars
+indicatif = "0.17"

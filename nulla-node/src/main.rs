@@ -1,11 +1,13 @@
-use std::{path::PathBuf, str::FromStr};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use nulla_core::{BlockHeader, Hash32};
 use nulla_db::NullaDb;
 use nulla_net::{self, protocol, NetConfig, NetworkCommand, NetworkEvent};
 use tokio::signal;
+use tokio::sync::Mutex;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -52,6 +54,10 @@ struct Args {
     /// Enable stub miner (for gossip testing only; broadcasts dummy blocks).
     #[arg(long, default_value_t = false)]
     mine: bool,
+
+    /// Enable seed mode (builds blocks on top of chain, no mining).
+    #[arg(long, default_value_t = false)]
+    seed: bool,
 
     /// RPC server bind address (placeholder; not yet wired).
     #[arg(long, default_value = "127.0.0.1:27447")]
@@ -100,14 +106,25 @@ async fn main() -> Result<()> {
 
         // Spawn event handler for inbound network events and request/response.
         let cmd_tx = handle.commands.clone();
-        tokio::spawn(handle_network_events(handle.events, cmd_tx.clone(), db.clone()));
+        let sync_progress = Arc::new(Mutex::new(None::<ProgressBar>));
+        tokio::spawn(handle_network_events(
+            handle.events,
+            cmd_tx.clone(),
+            db.clone(),
+            sync_progress.clone(),
+        ));
 
         // Spawn periodic peer sync task
         tokio::spawn(periodic_peer_sync(cmd_tx.clone(), db.clone()));
 
         // If mining is enabled, spawn the stub miner task.
         if args.mine {
-            spawn_miner(chain_id, cmd_tx)?;
+            spawn_miner(chain_id, cmd_tx.clone())?;
+        }
+
+        // If seed mode is enabled, spawn the seed block builder.
+        if args.seed {
+            spawn_seed(chain_id, cmd_tx, db.clone(), handle.local_peer_id)?;
         }
     } else {
         info!("gossip stack disabled; node running in local-only mode");
@@ -151,6 +168,7 @@ async fn handle_network_events(
     rx: async_channel::Receiver<NetworkEvent>,
     cmd_tx: async_channel::Sender<NetworkCommand>,
     db: NullaDb,
+    sync_progress: Arc<Mutex<Option<ProgressBar>>>,
 ) {
     while let Ok(evt) = rx.recv().await {
         match evt {
@@ -158,14 +176,79 @@ async fn handle_network_events(
                 info!("inv tx from {from}: {}", hex::encode(txid));
             }
             NetworkEvent::BlockInv { from, header } => {
+                let block_id = nulla_core::block_header_id(&header);
                 info!(
                     "inv block from {from} height={} id={}",
                     header.height,
-                    hex::encode(nulla_core::block_header_id(&header))
+                    hex::encode(block_id)
                 );
+
                 // Store the header in the database.
                 if let Err(e) = db.put_header(&header) {
                     warn!("failed to store header: {e}");
+                    continue;
+                }
+
+                // Check if this block is on top of our current best tip.
+                match db.best_tip() {
+                    Ok(Some((tip_id, tip_height))) => {
+                        // If this block builds on our tip, update the tip.
+                        if header.prev == tip_id && header.height == tip_height + 1 {
+                            if let Err(e) = db.set_best_tip(&block_id, header.height) {
+                                warn!("failed to update best tip: {e}");
+                            } else {
+                                info!("updated best tip to height {}", header.height);
+
+                                // Update progress bar if syncing.
+                                let mut progress_lock = sync_progress.lock().await;
+                                if let Some(ref pb) = *progress_lock {
+                                    pb.set_position(header.height);
+                                    if header.height >= pb.length().unwrap_or(0) {
+                                        pb.finish_with_message("✓ Synced!");
+                                        *progress_lock = None;
+                                    }
+                                }
+                            }
+                        } else if header.height > tip_height {
+                            // We're behind, need to sync.
+                            let blocks_behind = header.height - tip_height;
+                            info!(
+                                "we're behind (our height: {tip_height}, their height: {}), {} blocks behind",
+                                header.height, blocks_behind
+                            );
+
+                            // Create or update progress bar.
+                            let mut progress_lock = sync_progress.lock().await;
+                            if progress_lock.is_none() {
+                                let pb = ProgressBar::new(header.height);
+                                pb.set_style(
+                                    ProgressStyle::default_bar()
+                                        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} blocks ({eta})")
+                                        .expect("progress style")
+                                        .progress_chars("=>-"),
+                                );
+                                pb.set_position(tip_height);
+                                *progress_lock = Some(pb);
+                            } else if let Some(ref pb) = *progress_lock {
+                                if header.height > pb.length().unwrap_or(0) {
+                                    pb.set_length(header.height);
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No tip yet, this is our genesis.
+                        if header.height == 0 {
+                            if let Err(e) = db.set_best_tip(&block_id, 0) {
+                                warn!("failed to set genesis tip: {e}");
+                            } else {
+                                info!("set genesis block as tip");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("failed to get best tip: {e}");
+                    }
                 }
             }
             NetworkEvent::Request { peer, req, channel } => {
@@ -292,4 +375,81 @@ async fn periodic_peer_sync(
 
         info!("periodic sync tick (peer discovery and chain sync)");
     }
+}
+
+/// Spawn a seed node that builds blocks on top of the chain without mining.
+///
+/// The seed role:
+/// - Tracks the best chain tip from the database
+/// - Creates new blocks every 30 seconds building on top of the best tip
+/// - Increments block height properly
+/// - Does NOT perform proof-of-work (uses easy target for testing)
+/// - Uses its own peer ID to ensure only one seed creates blocks at a time
+fn spawn_seed(
+    chain_id: [u8; 4],
+    cmd_tx: async_channel::Sender<NetworkCommand>,
+    db: NullaDb,
+    local_peer_id: libp2p::PeerId,
+) -> Result<()> {
+    tokio::spawn(async move {
+        info!("seed node started (peer_id: {local_peer_id})");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            // Get the current best tip from the database.
+            let (prev_id, prev_height) = match db.best_tip() {
+                Ok(Some((id, height))) => {
+                    info!("seed: building on height {height}");
+                    (id, height)
+                }
+                Ok(None) => {
+                    info!("seed: no tip found, building genesis block");
+                    (Hash32::default(), 0)
+                }
+                Err(e) => {
+                    warn!("seed: failed to get best tip: {e}");
+                    continue;
+                }
+            };
+
+            // Build the next block on top of the previous tip.
+            let next_height = if prev_id == Hash32::default() {
+                0 // Genesis block
+            } else {
+                prev_height + 1
+            };
+
+            let header = BlockHeader {
+                chain_id,
+                version: 1,
+                height: next_height,
+                prev: prev_id,
+                merkle_root: Hash32::default(),
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                target: [0xffu8; 32], // Very easy target (no real mining)
+                nonce: rand::random(),
+            };
+
+            let block_id = nulla_core::block_header_id(&header);
+            info!(
+                "seed: broadcasting block height={} id={}",
+                next_height,
+                hex::encode(block_id)
+            );
+
+            // Store the header in the database and update the best tip.
+            if let Err(e) = db.put_header(&header) {
+                warn!("seed: failed to store header: {e}");
+                continue;
+            }
+            if let Err(e) = db.set_best_tip(&block_id, next_height) {
+                warn!("seed: failed to set best tip: {e}");
+                continue;
+            }
+
+            // Broadcast the block to the network.
+            let _ = cmd_tx.send(NetworkCommand::PublishBlock { header }).await;
+        }
+    });
+    Ok(())
 }

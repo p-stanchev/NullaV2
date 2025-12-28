@@ -6,30 +6,34 @@
 //! - Kademlia DHT for peer discovery
 //! - Request/response protocol for block and header sync
 //! - Dandelion++ transaction privacy protocol
-//! - Cover traffic support (placeholder)
+//! - Cover traffic support
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use futures::prelude::*;
 use libp2p::{
-    gossipsub, identify, identity, kad, noise, ping,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    identify, noise, ping,
+    swarm::SwarmEvent,
     tcp, Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
-use rand::{seq::SliceRandom, Rng};
-use std::num::NonZeroUsize;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::select;
-use tracing::{info, warn};
+use tracing::info;
 
 use nulla_core::{block_header_id, BlockHeader, Hash32};
+
+mod behaviour;
+mod gossip;
+mod kad;
+
+pub use behaviour::Behaviour;
 
 /// Protocol definitions and message types.
 pub mod protocol {
     use super::*;
     use nulla_core::{Block, BlockHeader, Tx};
+    use serde::{Deserialize, Serialize};
 
     /// Maximum number of headers returned in a single response.
     pub const MAX_HEADERS: usize = 2048;
@@ -115,6 +119,9 @@ pub mod protocol {
 pub mod dandelion {
     use super::*;
     use lru::LruCache;
+    use rand::{seq::SliceRandom, Rng};
+    use std::num::NonZeroUsize;
+    use std::time::Instant;
 
     /// Action to take when processing a transaction in Dandelion++ mode.
     #[derive(Debug)]
@@ -248,7 +255,7 @@ pub struct NetConfig {
     pub peers: Vec<Multiaddr>,
     /// Enable Dandelion++ transaction privacy.
     pub dandelion: bool,
-    /// Enable cover traffic (placeholder; not yet fully wired).
+    /// Enable cover traffic.
     pub cover_traffic: bool,
 }
 
@@ -311,17 +318,10 @@ pub enum NetError {
     Anyhow(#[from] anyhow::Error),
 }
 
-#[derive(NetworkBehaviour)]
-struct Behaviour {
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
-    gossipsub: gossipsub::Behaviour,
-    kad: kad::Behaviour<kad::store::MemoryStore>,
-}
-
 /// Placeholder for request/response channel (simplified since libp2p API changed).
 pub type ResponseChannel = ();
 
+/// Network handle for sending commands and receiving events.
 pub struct NetworkHandle {
     pub commands: Sender<NetworkCommand>,
     pub events: Receiver<NetworkEvent>,
@@ -330,7 +330,7 @@ pub struct NetworkHandle {
 
 /// Spawn the network task and return a handle for sending commands and receiving events.
 pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError> {
-    let cfg_clone = config.clone();
+    let chain_id = config.chain_id;
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -339,13 +339,10 @@ pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError>
             libp2p::yamux::Config::default,
         )
         .map_err(|e| anyhow::anyhow!("transport error: {e}"))?
-        .with_behaviour(move |id| {
-            build_behaviour(id, &cfg_clone)
-        })
+        .with_behaviour(move |id| behaviour::build_behaviour(id, &chain_id))
         .map_err(|e| anyhow::anyhow!("behaviour error: {e}"))?
         .build();
     let peer_id = *swarm.local_peer_id();
-    let chain_id = config.chain_id;
     let cover_traffic = config.cover_traffic;
 
     for addr in &config.listen {
@@ -357,9 +354,12 @@ pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError>
             .map_err(|e| anyhow::anyhow!("dial error: {e}"))?;
     }
 
-    // Bootstrap Kademlia DHT if we have initial peers
+    // Bootstrap Kademlia DHT if we have initial peers.
     if !config.peers.is_empty() {
-        info!("bootstrapping Kademlia DHT with {} initial peer(s)", config.peers.len());
+        info!(
+            "bootstrapping Kademlia DHT with {} initial peer(s)",
+            config.peers.len()
+        );
         let _ = swarm.behaviour_mut().kad.bootstrap();
     }
 
@@ -376,47 +376,6 @@ pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError>
     })
 }
 
-fn build_behaviour(
-    keypair: &identity::Keypair,
-    config: &NetConfig,
-) -> Result<Behaviour, Box<dyn std::error::Error + Send + Sync>> {
-    let peer_id = PeerId::from(keypair.public());
-    let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .validation_mode(gossipsub::ValidationMode::Strict)
-        .max_transmit_size(1024 * 64)
-        .build()
-        .expect("gossipsub config");
-
-    let mut gossipsub = gossipsub::Behaviour::new(
-        gossipsub::MessageAuthenticity::Signed(keypair.clone()),
-        gossipsub_config,
-    )
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) })?;
-    let tx_topic = gossipsub::IdentTopic::new(protocol::topic_inv_tx(&config.chain_id));
-    let block_topic = gossipsub::IdentTopic::new(protocol::topic_inv_block(&config.chain_id));
-    gossipsub
-        .subscribe(&tx_topic)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) })?;
-    gossipsub
-        .subscribe(&block_topic)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) })?;
-
-    let store = kad::store::MemoryStore::new(peer_id);
-    let kad = kad::Behaviour::new(peer_id, store);
-
-    let identify = libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
-        "/nulla/1".into(),
-        keypair.public(),
-    ));
-
-    Ok(Behaviour {
-        identify,
-        ping: ping::Behaviour::default(),
-        gossipsub,
-        kad,
-    })
-}
-
 /// Main swarm event loop with optional cover traffic.
 async fn run_swarm(
     mut swarm: Swarm<Behaviour>,
@@ -425,7 +384,7 @@ async fn run_swarm(
     chain_id: [u8; 4],
     cover_traffic: bool,
 ) {
-    // Cover traffic interval: send a noise message every 45-90 seconds (randomized).
+    // Cover traffic interval: send a noise message every 60 seconds.
     let mut cover_traffic_interval = if cover_traffic {
         Some(tokio::time::interval(Duration::from_secs(60)))
     } else {
@@ -436,7 +395,7 @@ async fn run_swarm(
         select! {
             swarm_event = swarm.select_next_some() => {
                 if handle_swarm_event(&mut swarm, swarm_event, &evt_tx).await.is_err() {
-                    // best-effort logging, do not crash the loop
+                    // Best-effort logging, do not crash the loop.
                 }
             }
             cmd = cmd_rx.recv() => {
@@ -454,26 +413,16 @@ async fn run_swarm(
                 }
             } => {
                 // Broadcast a cover traffic noise message.
-                send_cover_traffic(&mut swarm, chain_id);
+                gossip::send_cover_traffic(&mut swarm, chain_id);
             }
         }
     }
 }
 
-/// Send a cover traffic noise message to the network.
-fn send_cover_traffic(swarm: &mut Swarm<Behaviour>, chain_id: [u8; 4]) {
-    let noise_bytes: [u8; 32] = rand::random();
-    let msg = protocol::GossipMsg::Noise { bytes: noise_bytes };
-    if let Ok(data) = postcard::to_allocvec(&msg) {
-        let topic = gossipsub::IdentTopic::new(protocol::topic_inv_tx(&chain_id));
-        let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
-        info!("sent cover traffic noise message");
-    }
-}
-
+/// Handle swarm events and emit network events.
 async fn handle_swarm_event(
     _swarm: &mut Swarm<Behaviour>,
-    event: SwarmEvent<BehaviourEvent>,
+    event: SwarmEvent<behaviour::BehaviourEvent>,
     evt_tx: &Sender<NetworkEvent>,
 ) -> Result<(), NetError> {
     match event {
@@ -481,67 +430,35 @@ async fn handle_swarm_event(
             let _ = evt_tx.send(NetworkEvent::NewListen(address)).await;
         }
         SwarmEvent::Behaviour(behaviour_event) => match behaviour_event {
-            BehaviourEvent::Ping(ping::Event { peer, connection, result }) => {
+            behaviour::BehaviourEvent::Ping(ping::Event {
+                peer,
+                connection,
+                result,
+            }) => {
                 if result.is_ok() {
                     info!("ping ok from {peer} on connection {connection:?}");
                     let _ = evt_tx.send(NetworkEvent::PeerConnected(peer)).await;
                 }
             }
-            BehaviourEvent::Gossipsub(ev) => {
-                if let gossipsub::Event::Message {
+            behaviour::BehaviourEvent::Gossipsub(ev) => {
+                if let libp2p::gossipsub::Event::Message {
                     propagation_source,
                     message,
                     ..
                 } = ev
                 {
-                    if let Ok(msg) = postcard::from_bytes::<protocol::GossipMsg>(&message.data) {
-                        match msg {
-                            protocol::GossipMsg::InvTx { txid } => {
-                                let _ = evt_tx
-                                    .send(NetworkEvent::TxInv {
-                                        from: propagation_source,
-                                        txid,
-                                    })
-                                    .await;
-                            }
-                            protocol::GossipMsg::InvBlock { header } => {
-                                let _ = evt_tx
-                                    .send(NetworkEvent::BlockInv {
-                                        from: propagation_source,
-                                        header,
-                                    })
-                                    .await;
-                            }
-                            protocol::GossipMsg::Noise { .. } => {}
-                        }
-                    }
+                    gossip::handle_gossip_message(propagation_source, &message.data, evt_tx).await;
                 }
             }
-            BehaviourEvent::Kad(kad_event) => match kad_event {
-                kad::Event::RoutingUpdated { peer, .. } => {
-                    info!("kad: routing updated with peer {peer}");
-                    let _ = evt_tx.send(NetworkEvent::PeerConnected(peer)).await;
-                }
-                kad::Event::OutboundQueryProgressed { result, .. } => {
-                    match result {
-                        kad::QueryResult::GetClosestPeers(Ok(ok)) => {
-                            info!("kad: discovered {} peers via GetClosestPeers", ok.peers.len());
-                            for peer_info in ok.peers {
-                                let _ = evt_tx.send(NetworkEvent::PeerConnected(peer_info.peer_id)).await;
-                            }
-                        }
-                        kad::QueryResult::Bootstrap(Ok(ok)) => {
-                            info!("kad: bootstrap succeeded, {} peers in routing table", ok.num_remaining);
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            },
-            BehaviourEvent::Identify(identify_event) => {
+            behaviour::BehaviourEvent::Kad(kad_event) => {
+                kad::handle_kad_event(kad_event, evt_tx).await;
+            }
+            behaviour::BehaviourEvent::Identify(identify_event) => {
                 if let identify::Event::Received { peer_id, info, .. } = identify_event {
-                    info!("identify: received from {peer_id}, listen addrs: {}", info.listen_addrs.len());
-                    // When we identify a peer, add it to Kademlia DHT
+                    info!(
+                        "identify: received from {peer_id}, listen addrs: {}",
+                        info.listen_addrs.len()
+                    );
                     for addr in info.listen_addrs {
                         info!("identify: peer {peer_id} listening on {addr}");
                     }
@@ -556,29 +473,19 @@ async fn handle_swarm_event(
     Ok(())
 }
 
+/// Apply a network command to the swarm.
 fn apply_command(swarm: &mut Swarm<Behaviour>, command: NetworkCommand, chain_id: [u8; 4]) {
     match command {
         NetworkCommand::Dial(addr) => {
             if let Err(err) = Swarm::dial(swarm, addr.clone()) {
-                warn!("dial error {addr}: {err:?}");
+                tracing::warn!("dial error {addr}: {err:?}");
             }
         }
         NetworkCommand::PublishTx { txid } => {
-            let msg = protocol::GossipMsg::InvTx { txid };
-            if let Ok(data) = postcard::to_allocvec(&msg) {
-                let topic =
-                    gossipsub::IdentTopic::new(protocol::topic_inv_tx(&chain_id));
-                let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
-            }
+            gossip::publish_tx(swarm, chain_id, txid);
         }
         NetworkCommand::PublishBlock { header } => {
-            let msg = protocol::GossipMsg::InvBlock { header: header.clone() };
-            if let Ok(data) = postcard::to_allocvec(&msg) {
-                let topic = gossipsub::IdentTopic::new(protocol::topic_inv_block(
-                    &header.chain_id,
-                ));
-                let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
-            }
+            gossip::publish_block(swarm, header);
         }
         NetworkCommand::SendRequest { peer, req } => {
             // Request/response simplified - log for now.
@@ -591,12 +498,14 @@ fn apply_command(swarm: &mut Swarm<Behaviour>, command: NetworkCommand, chain_id
     }
 }
 
+/// Build a block inventory message from a block header.
 pub fn build_inv_block(header: &BlockHeader) -> protocol::GossipMsg {
     protocol::GossipMsg::InvBlock {
         header: header.clone(),
     }
 }
 
+/// Get the block ID from a block header.
 pub fn inv_block_id(header: &BlockHeader) -> Hash32 {
     block_header_id(header)
 }

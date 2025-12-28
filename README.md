@@ -82,15 +82,31 @@ cargo run -p nulla-node -- --peers /ip4/127.0.0.1/tcp/27444 --db ./data2
 
 The nodes will connect, exchange peer information, and gossip blocks/transactions.
 
+### Enabling Seed Mode
+
+To create blocks that properly build a chain (with incrementing height):
+
+```bash
+cargo run -p nulla-node -- --listen /ip4/0.0.0.0/tcp/27444 --seed
+```
+
+The seed node:
+- Reads the current best tip from the database
+- Creates new blocks every 30 seconds building on top of the previous block
+- Increments block height properly (genesis at height 0, then 1, 2, 3...)
+- Does NOT perform proof-of-work (uses easy target for testing)
+- Broadcasts blocks to all connected peers
+- Shows a **progress bar** when syncing blocks from other nodes
+
 ### Enabling the Stub Miner
 
-To test gossip propagation, enable the stub miner on one or both nodes:
+To test raw gossip propagation (broadcasts independent dummy blocks):
 
 ```bash
 cargo run -p nulla-node -- --listen /ip4/0.0.0.0/tcp/27444 --mine
 ```
 
-The miner broadcasts dummy blocks every 30 seconds for testing purposes.
+The stub miner broadcasts independent dummy blocks every 30 seconds. Unlike `--seed`, these blocks do NOT build on each other (all at height 0).
 
 ### Running on a VPS
 
