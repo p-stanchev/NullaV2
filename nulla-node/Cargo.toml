@@ -13,6 +13,7 @@ path = "src/main.rs"
 nulla-core = { path = "../nulla-core" }
 nulla-db = { path = "../nulla-db" }
 nulla-net = { path = "../nulla-net" }
+nulla-wallet = { path = "../nulla-wallet" }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "nulla-wallet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+nulla-core = { path = "../nulla-core" }
+blake3.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+hex.workspace = true

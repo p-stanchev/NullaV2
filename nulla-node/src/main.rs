@@ -6,6 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use nulla_core::{BlockHeader, Hash32};
 use nulla_db::NullaDb;
 use nulla_net::{self, protocol, NetConfig, NetworkCommand, NetworkEvent};
+use nulla_wallet::Wallet;
 use tokio::signal;
 use tokio::sync::Mutex;
 use tracing::{info, warn, Level};
@@ -70,15 +71,51 @@ struct Args {
     /// SOCKS5 proxy address (placeholder; not yet wired).
     #[arg(long)]
     socks5: Option<String>,
+
+    /// Generate a new wallet and print the address and seed.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    generate_wallet: bool,
+
+    /// Wallet seed (32 bytes hex) to use for signing transactions.
+    #[arg(long)]
+    wallet_seed: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
+
+    // Handle wallet generation command.
+    if args.generate_wallet {
+        let wallet = Wallet::new();
+        let seed_hex = hex::encode(wallet.keypair().to_bytes());
+        println!("\n=== New Wallet Generated ===");
+        println!("Address: {}", wallet.address());
+        println!("Seed:    {}", seed_hex);
+        println!("\nSave your seed securely! You can use it with --wallet-seed to restore this wallet.");
+        println!("Example: nulla --wallet-seed {}\n", seed_hex);
+        return Ok(());
+    }
+
     let chain_id = chain_id_bytes(&args.chain_id);
 
     info!("starting nulla-node chain_id={:?}", args.chain_id);
+
+    // Load wallet if seed is provided.
+    if let Some(seed_hex) = &args.wallet_seed {
+        match hex::decode(seed_hex) {
+            Ok(seed_bytes) if seed_bytes.len() == 32 => {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&seed_bytes);
+                let wallet = Wallet::from_seed(&seed);
+                info!("wallet loaded, address: {}", wallet.address());
+            }
+            _ => {
+                warn!("invalid wallet seed (must be 32 bytes hex), ignoring");
+            }
+        }
+    }
 
     // Open the database for blocks, headers, UTXOs, and mempool.
     let db = NullaDb::open(&args.db)?;

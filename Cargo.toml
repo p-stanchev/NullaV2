@@ -4,6 +4,7 @@ members = [
     "nulla-core",
     "nulla-db",
     "nulla-net",
+    "nulla-wallet",
     "nulla-node",
 ]
 

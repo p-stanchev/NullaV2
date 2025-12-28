@@ -108,6 +108,27 @@ cargo run -p nulla-node -- --listen /ip4/0.0.0.0/tcp/27444 --mine
 
 The stub miner broadcasts independent dummy blocks every 30 seconds. Unlike `--seed`, these blocks do NOT build on each other (all at height 0).
 
+### Wallet Operations
+
+Generate a new wallet:
+```bash
+cargo run -p nulla-node -- --generate-wallet
+```
+
+This outputs:
+```
+=== New Wallet Generated ===
+Address: 79bc6374ccc99f1211770ce007e05f6235b98c8b
+Seed:    a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094
+```
+
+**Save your seed securely!** You can restore your wallet using:
+```bash
+cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --listen /ip4/0.0.0.0/tcp/27444
+```
+
+The node will log: `wallet loaded, address: 79bc6374ccc99f1211770ce007e05f6235b98c8b`
+
 ### Running on a VPS
 
 To run a public seed node on a VPS that others can connect to:
@@ -166,11 +187,17 @@ sudo ufw reload
 - `--dandelion`: Enable Dandelion++ transaction privacy (enabled by default)
 - `--no-dandelion`: Disable Dandelion++ transaction privacy
 - `--cover-traffic`: Enable cover traffic for network-level privacy (experimental)
-- `--mine`: Enable stub miner (broadcasts dummy blocks for testing)
+- `--seed`: Enable seed mode (creates sequential blocks building on chain, no mining)
+- `--mine`: Enable stub miner (broadcasts dummy blocks for testing, all at height 0)
 
 ### Storage
 
 - `--db <PATH>`: Database directory path (default: `./data`)
+
+### Wallet
+
+- `--generate-wallet`: Generate a new wallet and print address and seed
+- `--wallet-seed <HEX>`: Load wallet from 32-byte hex seed
 
 ### Placeholders (Not Yet Implemented)
 
@@ -186,23 +213,29 @@ sudo ufw reload
 - [x] BLAKE3-based hashing and Merkle trees
 - [x] Proof-of-work validation
 - [x] UTXO database (sled-based storage)
-- [x] P2P networking with libp2p
+- [x] P2P networking with libp2p (modular: behaviour, gossip, kad modules)
 - [x] Gossipsub for block/transaction propagation
 - [x] Dandelion++ transaction privacy protocol
 - [x] Peer discovery via Kademlia DHT
+- [x] Seed node mode (creates sequential blocks, increments height)
 - [x] Basic stub miner for testing
 - [x] Request/response handlers for block sync
 - [x] Cover traffic implementation
 - [x] Transaction validation and structure checking
 - [x] Mempool management (add, remove, query, clear)
 - [x] Chain reorganization support (UTXO rollback, reorg helpers)
+- [x] Block sync detection with progress bar UI
+- [x] Best tip tracking and automatic updates
+- [x] Wallet functionality (Ed25519 keypairs, address generation, transaction signing)
+- [x] CLI commands for wallet generation and restoration
 
 ### In Progress 🚧
-
+- [ ] Chain selection based on cumulative work
+- [ ] Fork resolution and reorganization
+- [ ] Active block fetching when behind
 - [ ] Full script execution and signature verification
 - [ ] Difficulty adjustment algorithm
-- [ ] Proper chain selection (most work, not just longest)
-- [ ] Complete block synchronization protocol
+- [ ] Economic model (block rewards, transaction fees)
 
 ### Planned 📋
 
