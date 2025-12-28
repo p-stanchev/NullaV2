@@ -121,6 +121,12 @@ pub enum ValidationError {
     InsufficientValue,
     #[error("output value overflow")]
     ValueOverflow,
+    #[error("utxo not found")]
+    UtxoNotFound,
+    #[error("utxo already spent")]
+    UtxoAlreadySpent,
+    #[error("invalid coinbase")]
+    InvalidCoinbase,
 }
 
 /// Check if a transaction is a coinbase transaction (first tx in block with null input).

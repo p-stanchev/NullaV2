@@ -254,4 +254,96 @@ impl NullaDb {
         self.put_block(block)?;
         Ok(())
     }
+
+    /// Validate a transaction's inputs against the UTXO set.
+    ///
+    /// Returns Ok with total input value if all inputs are valid and unspent.
+    /// Returns Err if any input is missing or already spent.
+    pub fn validate_tx_inputs(&self, tx: &nulla_core::Tx) -> Result<u64> {
+        let mut total_input: u64 = 0;
+
+        for input in &tx.inputs {
+            // Skip validation for coinbase inputs
+            if input.prevout.txid == [0u8; 32] && input.prevout.vout == 0xFFFF_FFFF {
+                continue;
+            }
+
+            // Check if UTXO exists
+            let utxo = match self.get_utxo(&input.prevout)? {
+                Some(u) => u,
+                None => {
+                    return Err(DbError::Serde(bincode::Error::new(
+                        bincode::ErrorKind::Custom("UTXO not found".to_string()),
+                    )));
+                }
+            };
+
+            // Check if already spent
+            if self.is_spent(&input.prevout)? {
+                return Err(DbError::Serde(bincode::Error::new(
+                    bincode::ErrorKind::Custom("UTXO already spent".to_string()),
+                )));
+            }
+
+            total_input = total_input
+                .checked_add(utxo.value_atoms)
+                .ok_or_else(|| {
+                    DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
+                        "Input value overflow".to_string(),
+                    )))
+                })?;
+        }
+
+        Ok(total_input)
+    }
+
+    /// Apply a transaction to the UTXO set (mark inputs as spent, create new outputs).
+    pub fn apply_tx(&self, tx: &nulla_core::Tx) -> Result<()> {
+        let txid = nulla_core::tx_id(tx);
+
+        // Mark all inputs as spent (skip coinbase inputs)
+        for input in &tx.inputs {
+            if !input.prevout.is_null() {
+                self.mark_spent(&input.prevout, &txid)?;
+                self.remove_utxo(&input.prevout)?;
+            }
+        }
+
+        // Create new UTXOs for all outputs
+        for (vout, output) in tx.outputs.iter().enumerate() {
+            let outpoint = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            self.put_utxo(&outpoint, output)?;
+        }
+
+        Ok(())
+    }
+
+    /// Revert a transaction from the UTXO set (for chain reorganization).
+    pub fn revert_tx(&self, tx: &nulla_core::Tx) -> Result<()> {
+        let txid = nulla_core::tx_id(tx);
+
+        // Remove outputs created by this transaction
+        for (vout, _output) in tx.outputs.iter().enumerate() {
+            let outpoint = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            self.remove_utxo(&outpoint)?;
+            self.unmark_spent(&outpoint)?;
+        }
+
+        // Restore inputs (skip coinbase)
+        // Note: This requires the original UTXOs to be stored elsewhere
+        // For now, we'll just unmark them as spent
+        for input in &tx.inputs {
+            if !input.prevout.is_null() {
+                self.unmark_spent(&input.prevout)?;
+            }
+        }
+
+        Ok(())
+    }
 }
