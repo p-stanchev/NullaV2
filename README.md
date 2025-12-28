@@ -270,15 +270,18 @@ sudo ufw reload
 - [x] Best tip tracking and automatic updates
 - [x] Wallet functionality (Ed25519 keypairs, address generation, transaction signing)
 - [x] CLI commands for wallet generation and restoration
-
-### In Progress 🚧
-- [x] Chain selection based on cumulative work
+- [x] Chain selection based on cumulative work (Nakamoto consensus)
 - [x] Token economics (100M atoms per NULLA, 8 NULLA block reward)
 - [x] Wallet balance and address commands
 - [x] Coinbase transactions (block rewards paid to seed node wallet)
+- [x] UTXO validation (inputs exist, not double-spent, value conservation)
+- [x] Transaction application to UTXO set (mark spent, create new UTXOs)
+- [x] Transaction revert support for chain reorganizations
+
+### In Progress 🚧
 - [ ] Active block fetching when behind (gossip broadcasts headers only currently)
 - [ ] Full block gossip or request/response protocol for sync
-- [ ] Fork resolution and reorganization
+- [ ] Fork resolution and reorganization (helpers exist, needs wiring)
 - [ ] Full script execution and signature verification
 - [ ] Difficulty adjustment algorithm
 - [ ] UTXO indexing by address for balance calculation
