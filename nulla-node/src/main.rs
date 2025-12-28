@@ -513,6 +513,7 @@ async fn main() -> Result<()> {
             cmd_tx.clone(),
             db.clone(),
             sync_progress.clone(),
+            args.seed,
         ));
 
         // Spawn periodic peer sync task
@@ -583,6 +584,7 @@ async fn handle_network_events(
     cmd_tx: async_channel::Sender<NetworkCommand>,
     db: NullaDb,
     sync_progress: Arc<Mutex<Option<ProgressBar>>>,
+    seed_mode: bool,
 ) {
     while let Ok(evt) = rx.recv().await {
         match evt {
@@ -689,7 +691,7 @@ async fn handle_network_events(
                                 if let Some(ref pb) = *progress_lock {
                                     pb.set_position(header.height);
                                     if header.height >= pb.length().unwrap_or(0) {
-                                        pb.finish_with_message("✓ Synced!");
+                                        pb.finish_with_message("Synced!");
                                         *progress_lock = None;
                                     }
                                 }
@@ -752,161 +754,7 @@ async fn handle_network_events(
                 }
             }
             NetworkEvent::FullBlock { from, block } => {
-                let block_id = nulla_core::block_id(&block);
-                info!(
-                    "full block from {from} height={} id={} txs={}",
-                    block.header.height,
-                    hex::encode(block_id),
-                    block.txs.len()
-                );
-
-                // Validate the block structure
-                if let Err(e) = nulla_core::validate_block(&block) {
-                    warn!("received invalid block (structure): {e}");
-                    continue;
-                }
-
-                // Verify signatures on all transactions (except coinbase)
-                let mut block_valid = true;
-                for (i, tx) in block.txs.iter().enumerate() {
-                    if let Err(e) = db.verify_tx_signatures(tx) {
-                        warn!("block rejected: transaction {i} has invalid signature: {e}");
-                        block_valid = false;
-                        break;
-                    }
-                }
-                if !block_valid {
-                    continue;
-                }
-
-                // Validate UTXO inputs for all transactions (except coinbase)
-                for (i, tx) in block.txs.iter().enumerate() {
-                    if !nulla_core::is_coinbase(tx) {
-                        if let Err(e) = db.validate_tx_inputs(tx) {
-                            warn!("block rejected: transaction {i} has invalid inputs: {e}");
-                            block_valid = false;
-                            break;
-                        }
-                    }
-                }
-                if !block_valid {
-                    continue;
-                }
-
-                // Store the full block
-                if let Err(e) = db.put_block_full(&block) {
-                    warn!("failed to store full block: {e}");
-                    continue;
-                }
-
-                // Calculate cumulative work
-                let block_work = nulla_core::target_work(&block.header.target);
-                let cumulative_work = if block.header.prev == [0u8; 32] {
-                    block_work
-                } else {
-                    match db.get_work(&block.header.prev) {
-                        Ok(Some(prev_work)) => prev_work + block_work,
-                        _ => block_work,
-                    }
-                };
-
-                // Store cumulative work
-                if let Err(e) = db.set_work(&block_id, cumulative_work) {
-                    warn!("failed to store cumulative work: {e}");
-                }
-
-                // Apply transactions to UTXO set (coinbase and regular txs)
-                for tx in &block.txs {
-                    if let Err(e) = db.apply_tx(tx) {
-                        warn!("failed to apply transaction: {e}");
-                    }
-                }
-
-                // Remove transactions from mempool (they're now in a block)
-                for tx in block.txs.iter().skip(1) {
-                    // Skip coinbase
-                    let txid = nulla_core::tx_id(tx);
-                    let _ = db.remove_mempool_tx(&txid);
-                }
-
-                // Update best tip if appropriate
-                match db.best_tip() {
-                    Ok(Some((tip_id, tip_height, tip_work))) => {
-                        if block.header.prev == tip_id && block.header.height == tip_height + 1 {
-                            if let Err(e) =
-                                db.set_best_tip(&block_id, block.header.height, cumulative_work)
-                            {
-                                warn!("failed to update best tip: {e}");
-                            } else {
-                                info!(
-                                    "updated best tip to height {} (work: {})",
-                                    block.header.height, cumulative_work
-                                );
-
-                                // Update progress bar
-                                let mut progress_lock = sync_progress.lock().await;
-                                if let Some(ref pb) = *progress_lock {
-                                    pb.set_position(block.header.height);
-                                    if block.header.height >= pb.length().unwrap_or(0) {
-                                        pb.finish_with_message("✓ Synced!");
-                                        *progress_lock = None;
-                                    }
-                                }
-                            }
-                        } else if cumulative_work > tip_work {
-                            info!(
-                                "received chain with more work (our: {}, theirs: {}), height: {}",
-                                tip_work, cumulative_work, block.header.height
-                            );
-                            if let Err(e) =
-                                db.set_best_tip(&block_id, block.header.height, cumulative_work)
-                            {
-                                warn!("failed to update best tip: {e}");
-                            } else {
-                                info!(
-                                    "switched to new best chain at height {}",
-                                    block.header.height
-                                );
-                            }
-                        } else if block.header.height > tip_height {
-                            let blocks_behind = block.header.height - tip_height;
-                            info!(
-                                "we're behind (our height: {tip_height}, their height: {}), {} blocks behind",
-                                block.header.height, blocks_behind
-                            );
-
-                            // Create or update progress bar
-                            let mut progress_lock = sync_progress.lock().await;
-                            if progress_lock.is_none() {
-                                let pb = ProgressBar::new(block.header.height);
-                                pb.set_style(
-                                    ProgressStyle::default_bar()
-                                        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} blocks ({eta})")
-                                        .expect("progress style")
-                                        .progress_chars("=>-"),
-                                );
-                                pb.set_position(tip_height);
-                                *progress_lock = Some(pb);
-                            } else if let Some(ref pb) = *progress_lock {
-                                if block.header.height > pb.length().unwrap_or(0) {
-                                    pb.set_length(block.header.height);
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        if block.header.height == 0 {
-                            if let Err(e) = db.set_best_tip(&block_id, 0, cumulative_work) {
-                                warn!("failed to set genesis tip: {e}");
-                            } else {
-                                info!("set genesis block as tip (work: {})", cumulative_work);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("failed to get best tip: {e}");
-                    }
-                }
+                process_full_block(&db, &sync_progress, block, Some(from)).await;
             }
             NetworkEvent::Request { peer, req, channel } => {
                 info!("request from {peer:?}: {:?}", req);
@@ -918,10 +766,226 @@ async fn handle_network_events(
             }
             NetworkEvent::Response { peer, resp } => {
                 info!("response from {peer:?}: {:?}", resp);
+                if seed_mode {
+                    match resp {
+                        protocol::Resp::Tip {
+                            height,
+                            id,
+                            cumulative_work: _,
+                        } => {
+                            let local_height =
+                                db.best_tip().ok().flatten().map(|(_, h, _)| h).unwrap_or(0);
+                            if height > local_height {
+                                let _ = cmd_tx
+                                    .send(NetworkCommand::SendRequest {
+                                        peer,
+                                        req: protocol::Req::GetHeaders {
+                                            from: id,
+                                            limit: protocol::MAX_HEADERS as u32,
+                                        },
+                                    })
+                                    .await;
+                            }
+                        }
+                        protocol::Resp::Headers { headers } => {
+                            let mut requested = 0usize;
+                            for header in headers {
+                                let block_id = nulla_core::block_header_id(&header);
+                                if db.get_block(&block_id).ok().flatten().is_none() {
+                                    let _ = db.put_header(&header);
+                                    let _ = cmd_tx
+                                        .send(NetworkCommand::SendRequest {
+                                            peer,
+                                            req: protocol::Req::GetBlock { id: block_id },
+                                        })
+                                        .await;
+                                    requested += 1;
+                                    if requested >= 128 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        protocol::Resp::Block { block } => {
+                            if let Some(block) = block {
+                                process_full_block(&db, &sync_progress, block, Some(peer)).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             NetworkEvent::NewListen(addr) => info!("listening on {addr}"),
-            NetworkEvent::PeerConnected(peer) => info!("peer connected {peer}"),
+            NetworkEvent::PeerConnected(peer) => {
+                info!("peer connected {peer}");
+                if seed_mode {
+                    let _ = cmd_tx
+                        .send(NetworkCommand::SendRequest {
+                            peer,
+                            req: protocol::Req::GetTip,
+                        })
+                        .await;
+                }
+            }
             NetworkEvent::PeerDisconnected(peer) => info!("peer disconnected {peer}"),
+        }
+    }
+}
+
+async fn process_full_block(
+    db: &NullaDb,
+    sync_progress: &Arc<Mutex<Option<ProgressBar>>>,
+    block: nulla_core::Block,
+    from: Option<libp2p::PeerId>,
+) {
+    let block_id = nulla_core::block_id(&block);
+    if let Some(peer) = from {
+        info!(
+            "full block from {peer} height={} id={} txs={}",
+            block.header.height,
+            hex::encode(block_id),
+            block.txs.len()
+        );
+    } else {
+        info!(
+            "full block height={} id={} txs={}",
+            block.header.height,
+            hex::encode(block_id),
+            block.txs.len()
+        );
+    }
+
+    if let Err(e) = nulla_core::validate_block(&block) {
+        warn!("received invalid block (structure): {e}");
+        return;
+    }
+
+    let mut block_valid = true;
+    for (i, tx) in block.txs.iter().enumerate() {
+        if let Err(e) = db.verify_tx_signatures(tx) {
+            warn!("block rejected: transaction {i} has invalid signature: {e}");
+            block_valid = false;
+            break;
+        }
+    }
+    if !block_valid {
+        return;
+    }
+
+    for (i, tx) in block.txs.iter().enumerate() {
+        if !nulla_core::is_coinbase(tx) {
+            if let Err(e) = db.validate_tx_inputs(tx) {
+                warn!("block rejected: transaction {i} has invalid inputs: {e}");
+                block_valid = false;
+                break;
+            }
+        }
+    }
+    if !block_valid {
+        return;
+    }
+
+    if let Err(e) = db.put_block_full(&block) {
+        warn!("failed to store full block: {e}");
+        return;
+    }
+
+    let block_work = nulla_core::target_work(&block.header.target);
+    let cumulative_work = if block.header.prev == [0u8; 32] {
+        block_work
+    } else {
+        match db.get_work(&block.header.prev) {
+            Ok(Some(prev_work)) => prev_work + block_work,
+            _ => block_work,
+        }
+    };
+
+    if let Err(e) = db.set_work(&block_id, cumulative_work) {
+        warn!("failed to store cumulative work: {e}");
+    }
+
+    for tx in &block.txs {
+        if let Err(e) = db.apply_tx(tx) {
+            warn!("failed to apply transaction: {e}");
+        }
+    }
+
+    for tx in block.txs.iter().skip(1) {
+        let txid = nulla_core::tx_id(tx);
+        let _ = db.remove_mempool_tx(&txid);
+    }
+
+    match db.best_tip() {
+        Ok(Some((tip_id, tip_height, tip_work))) => {
+            if block.header.prev == tip_id && block.header.height == tip_height + 1 {
+                if let Err(e) = db.set_best_tip(&block_id, block.header.height, cumulative_work) {
+                    warn!("failed to update best tip: {e}");
+                } else {
+                    info!(
+                        "updated best tip to height {} (work: {})",
+                        block.header.height, cumulative_work
+                    );
+
+                    let mut progress_lock = sync_progress.lock().await;
+                    if let Some(ref pb) = *progress_lock {
+                        pb.set_position(block.header.height);
+                        if block.header.height >= pb.length().unwrap_or(0) {
+                            pb.finish_with_message("Synced!");
+                            *progress_lock = None;
+                        }
+                    }
+                }
+            } else if cumulative_work > tip_work {
+                info!(
+                    "received chain with more work (our: {}, theirs: {}), height: {}",
+                    tip_work, cumulative_work, block.header.height
+                );
+                if let Err(e) = db.set_best_tip(&block_id, block.header.height, cumulative_work) {
+                    warn!("failed to update best tip: {e}");
+                } else {
+                    info!(
+                        "switched to new best chain at height {}",
+                        block.header.height
+                    );
+                }
+            } else if block.header.height > tip_height {
+                let blocks_behind = block.header.height - tip_height;
+                info!(
+                    "we're behind (our height: {tip_height}, their height: {}), {} blocks behind",
+                    block.header.height, blocks_behind
+                );
+
+                let mut progress_lock = sync_progress.lock().await;
+                if progress_lock.is_none() {
+                    let pb = ProgressBar::new(block.header.height);
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template(
+                                "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} blocks ({eta})",
+                            )
+                            .expect("progress style")
+                            .progress_chars("=>-"),
+                    );
+                    pb.set_position(tip_height);
+                    *progress_lock = Some(pb);
+                } else if let Some(ref pb) = *progress_lock {
+                    if block.header.height > pb.length().unwrap_or(0) {
+                        pb.set_length(block.header.height);
+                    }
+                }
+            }
+        }
+        Ok(None) => {
+            if block.header.height == 0 {
+                if let Err(e) = db.set_best_tip(&block_id, 0, cumulative_work) {
+                    warn!("failed to set genesis tip: {e}");
+                } else {
+                    info!("set genesis block as tip (work: {})", cumulative_work);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("failed to get best tip: {e}");
         }
     }
 }

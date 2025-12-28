@@ -13,7 +13,8 @@ use std::time::Duration;
 use async_channel::{Receiver, Sender};
 use futures::prelude::*;
 use libp2p::{
-    identify, noise, ping, swarm::SwarmEvent, tcp, Multiaddr, PeerId, Swarm, SwarmBuilder,
+    identify, noise, ping, request_response, swarm::SwarmEvent, tcp, Multiaddr, PeerId, Swarm,
+    SwarmBuilder,
 };
 use thiserror::Error;
 use tokio::select;
@@ -24,6 +25,7 @@ use nulla_core::{block_header_id, Block, BlockHeader, Hash32};
 mod behaviour;
 mod gossip;
 mod kad;
+mod reqresp;
 
 pub use behaviour::Behaviour;
 
@@ -326,8 +328,8 @@ pub enum NetError {
     Anyhow(#[from] anyhow::Error),
 }
 
-/// Placeholder for request/response channel (simplified since libp2p API changed).
-pub type ResponseChannel = ();
+/// Request/response channel for replies.
+pub type ResponseChannel = request_response::ResponseChannel<protocol::Resp>;
 
 /// Network handle for sending commands and receiving events.
 pub struct NetworkHandle {
@@ -460,6 +462,38 @@ async fn handle_swarm_event(
             behaviour::BehaviourEvent::Kad(kad_event) => {
                 kad::handle_kad_event(kad_event, evt_tx).await;
             }
+            behaviour::BehaviourEvent::RequestResponse(event) => match event {
+                request_response::Event::Message { peer, message } => match message {
+                    request_response::Message::Request {
+                        request, channel, ..
+                    } => {
+                        let _ = evt_tx
+                            .send(NetworkEvent::Request {
+                                peer,
+                                req: request,
+                                channel,
+                            })
+                            .await;
+                    }
+                    request_response::Message::Response { response, .. } => {
+                        let _ = evt_tx
+                            .send(NetworkEvent::Response {
+                                peer,
+                                resp: response,
+                            })
+                            .await;
+                    }
+                },
+                request_response::Event::OutboundFailure { peer, error, .. } => {
+                    tracing::warn!("request failed for {peer:?}: {error}");
+                }
+                request_response::Event::InboundFailure { peer, error, .. } => {
+                    tracing::warn!("inbound request failed for {peer:?}: {error}");
+                }
+                request_response::Event::ResponseSent { peer, .. } => {
+                    tracing::debug!("response sent to {peer:?}");
+                }
+            },
             behaviour::BehaviourEvent::Identify(identify_event) => {
                 if let identify::Event::Received { peer_id, info, .. } = identify_event {
                     info!(
@@ -501,12 +535,16 @@ fn apply_command(swarm: &mut Swarm<Behaviour>, command: NetworkCommand, chain_id
             gossip::publish_full_block(swarm, block);
         }
         NetworkCommand::SendRequest { peer, req } => {
-            // Request/response simplified - log for now.
-            info!("send request to {peer:?}: {req:?}");
+            swarm
+                .behaviour_mut()
+                .request_response
+                .send_request(&peer, req);
         }
-        NetworkCommand::SendResponse { channel: _, resp } => {
-            // Request/response simplified - log for now.
-            info!("send response: {resp:?}");
+        NetworkCommand::SendResponse { channel, resp } => {
+            let _ = swarm
+                .behaviour_mut()
+                .request_response
+                .send_response(channel, resp);
         }
     }
 }
