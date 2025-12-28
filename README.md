@@ -275,9 +275,10 @@ sudo ufw reload
 - [x] Chain selection based on cumulative work
 - [x] Token economics (100M atoms per NULLA, 8 NULLA block reward)
 - [x] Wallet balance and address commands
-- [ ] Coinbase transactions (block rewards)
+- [x] Coinbase transactions (block rewards paid to seed node wallet)
+- [ ] Active block fetching when behind (gossip broadcasts headers only currently)
+- [ ] Full block gossip or request/response protocol for sync
 - [ ] Fork resolution and reorganization
-- [ ] Active block fetching when behind
 - [ ] Full script execution and signature verification
 - [ ] Difficulty adjustment algorithm
 - [ ] UTXO indexing by address for balance calculation
