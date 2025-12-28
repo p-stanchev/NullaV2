@@ -21,7 +21,7 @@ use thiserror::Error;
 use tokio::select;
 use tracing::info;
 
-use nulla_core::{block_header_id, BlockHeader, Hash32};
+use nulla_core::{block_header_id, Block, BlockHeader, Hash32};
 
 mod behaviour;
 mod gossip;
@@ -54,6 +54,8 @@ pub mod protocol {
         InvTx { txid: Hash32 },
         /// Block inventory announcement (includes full header).
         InvBlock { header: BlockHeader },
+        /// Full block broadcast (for small networks, includes all transactions).
+        FullBlock { block: Block },
         /// Cover traffic noise message for network privacy.
         Noise { bytes: [u8; 32] },
     }
@@ -280,6 +282,8 @@ pub enum NetworkCommand {
     PublishTx { txid: Hash32 },
     /// Publish a block to the network.
     PublishBlock { header: BlockHeader },
+    /// Publish a full block to the network (includes all transactions).
+    PublishFullBlock { block: Block },
     /// Send a request to a peer.
     SendRequest { peer: PeerId, req: protocol::Req },
     /// Send a response to a peer.
@@ -293,6 +297,8 @@ pub enum NetworkEvent {
     TxInv { from: PeerId, txid: Hash32 },
     /// Received a block inventory announcement.
     BlockInv { from: PeerId, header: BlockHeader },
+    /// Received a full block.
+    FullBlock { from: PeerId, block: Block },
     /// Received a request from a peer.
     Request {
         peer: PeerId,
@@ -486,6 +492,9 @@ fn apply_command(swarm: &mut Swarm<Behaviour>, command: NetworkCommand, chain_id
         }
         NetworkCommand::PublishBlock { header } => {
             gossip::publish_block(swarm, header);
+        }
+        NetworkCommand::PublishFullBlock { block } => {
+            gossip::publish_full_block(swarm, block);
         }
         NetworkCommand::SendRequest { peer, req } => {
             // Request/response simplified - log for now.

@@ -396,6 +396,119 @@ async fn handle_network_events(
                     }
                 }
             }
+            NetworkEvent::FullBlock { from, block } => {
+                let block_id = nulla_core::block_id(&block);
+                info!(
+                    "full block from {from} height={} id={} txs={}",
+                    block.header.height,
+                    hex::encode(block_id),
+                    block.txs.len()
+                );
+
+                // Validate the block structure
+                if let Err(e) = nulla_core::validate_block(&block) {
+                    warn!("received invalid block: {e}");
+                    continue;
+                }
+
+                // Store the full block
+                if let Err(e) = db.put_block_full(&block) {
+                    warn!("failed to store full block: {e}");
+                    continue;
+                }
+
+                // Calculate cumulative work
+                let block_work = nulla_core::target_work(&block.header.target);
+                let cumulative_work = if block.header.prev == [0u8; 32] {
+                    block_work
+                } else {
+                    match db.get_work(&block.header.prev) {
+                        Ok(Some(prev_work)) => prev_work + block_work,
+                        _ => block_work,
+                    }
+                };
+
+                // Store cumulative work
+                if let Err(e) = db.set_work(&block_id, cumulative_work) {
+                    warn!("failed to store cumulative work: {e}");
+                }
+
+                // Apply transactions to UTXO set (coinbase and regular txs)
+                for tx in &block.txs {
+                    if let Err(e) = db.apply_tx(tx) {
+                        warn!("failed to apply transaction: {e}");
+                    }
+                }
+
+                // Update best tip if appropriate
+                match db.best_tip() {
+                    Ok(Some((tip_id, tip_height, tip_work))) => {
+                        if block.header.prev == tip_id && block.header.height == tip_height + 1 {
+                            if let Err(e) = db.set_best_tip(&block_id, block.header.height, cumulative_work) {
+                                warn!("failed to update best tip: {e}");
+                            } else {
+                                info!("updated best tip to height {} (work: {})", block.header.height, cumulative_work);
+
+                                // Update progress bar
+                                let mut progress_lock = sync_progress.lock().await;
+                                if let Some(ref pb) = *progress_lock {
+                                    pb.set_position(block.header.height);
+                                    if block.header.height >= pb.length().unwrap_or(0) {
+                                        pb.finish_with_message("✓ Synced!");
+                                        *progress_lock = None;
+                                    }
+                                }
+                            }
+                        } else if cumulative_work > tip_work {
+                            info!(
+                                "received chain with more work (our: {}, theirs: {}), height: {}",
+                                tip_work, cumulative_work, block.header.height
+                            );
+                            if let Err(e) = db.set_best_tip(&block_id, block.header.height, cumulative_work) {
+                                warn!("failed to update best tip: {e}");
+                            } else {
+                                info!("switched to new best chain at height {}", block.header.height);
+                            }
+                        } else if block.header.height > tip_height {
+                            let blocks_behind = block.header.height - tip_height;
+                            info!(
+                                "we're behind (our height: {tip_height}, their height: {}), {} blocks behind",
+                                block.header.height, blocks_behind
+                            );
+
+                            // Create or update progress bar
+                            let mut progress_lock = sync_progress.lock().await;
+                            if progress_lock.is_none() {
+                                let pb = ProgressBar::new(block.header.height);
+                                pb.set_style(
+                                    ProgressStyle::default_bar()
+                                        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} blocks ({eta})")
+                                        .expect("progress style")
+                                        .progress_chars("=>-"),
+                                );
+                                pb.set_position(tip_height);
+                                *progress_lock = Some(pb);
+                            } else if let Some(ref pb) = *progress_lock {
+                                if block.header.height > pb.length().unwrap_or(0) {
+                                    pb.set_length(block.header.height);
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        if block.header.height == 0 {
+                            if let Err(e) = db.set_best_tip(&block_id, 0, cumulative_work) {
+                                warn!("failed to set genesis tip: {e}");
+                            } else {
+                                info!("set genesis block as tip (work: {})", cumulative_work);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("failed to get best tip: {e}");
+                    }
+                }
+            }
             NetworkEvent::Request { peer, req, channel } => {
                 info!("request from {peer:?}: {:?}", req);
                 // Handle the request and send a response.
@@ -658,8 +771,8 @@ fn spawn_seed(
                 }
             }
 
-            // Broadcast the block to the network.
-            let _ = cmd_tx.send(NetworkCommand::PublishBlock { header }).await;
+            // Broadcast the full block to the network (includes transactions).
+            let _ = cmd_tx.send(NetworkCommand::PublishFullBlock { block }).await;
         }
     });
     Ok(())

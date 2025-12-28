@@ -3,7 +3,7 @@
 use libp2p::{gossipsub, PeerId, Swarm};
 use tracing::info;
 
-use nulla_core::{BlockHeader, Hash32};
+use nulla_core::{Block, BlockHeader, Hash32};
 
 use crate::{behaviour::Behaviour, protocol};
 
@@ -23,6 +23,17 @@ pub fn publish_block(swarm: &mut Swarm<Behaviour>, header: BlockHeader) {
     };
     if let Ok(data) = postcard::to_allocvec(&msg) {
         let topic = gossipsub::IdentTopic::new(protocol::topic_inv_block(&header.chain_id));
+        let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
+    }
+}
+
+/// Publish a full block to the network (includes all transactions).
+pub fn publish_full_block(swarm: &mut Swarm<Behaviour>, block: Block) {
+    let msg = protocol::GossipMsg::FullBlock {
+        block: block.clone(),
+    };
+    if let Ok(data) = postcard::to_allocvec(&msg) {
+        let topic = gossipsub::IdentTopic::new(protocol::topic_inv_block(&block.header.chain_id));
         let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
     }
 }
@@ -59,6 +70,14 @@ pub async fn handle_gossip_message(
                     .send(crate::NetworkEvent::BlockInv {
                         from: propagation_source,
                         header,
+                    })
+                    .await;
+            }
+            protocol::GossipMsg::FullBlock { block } => {
+                let _ = evt_tx
+                    .send(crate::NetworkEvent::FullBlock {
+                        from: propagation_source,
+                        block,
                     })
                     .await;
             }
