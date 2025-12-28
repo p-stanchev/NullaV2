@@ -1,9 +1,17 @@
-use std::{path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    path::PathBuf,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::Result;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use nulla_core::{BlockHeader, Hash32};
+use nulla_core::Hash32;
 use nulla_db::NullaDb;
 use nulla_net::{self, protocol, NetConfig, NetworkCommand, NetworkEvent};
 use nulla_wallet::Wallet;
@@ -177,13 +185,18 @@ async fn main() -> Result<()> {
 
                     println!("\n=== Wallet Balance ===");
                     println!("Address: {}", address);
-                    println!("Balance: {} NULLA ({} atoms)", nulla_wallet::atoms_to_nulla(balance_atoms), balance_atoms);
+                    println!(
+                        "Balance: {} NULLA ({} atoms)",
+                        nulla_wallet::atoms_to_nulla(balance_atoms),
+                        balance_atoms
+                    );
                     println!("UTXOs:   {}", utxo_count);
 
                     if !utxos.is_empty() {
                         println!("\nUTXO Details:");
                         for (outpoint, txout) in utxos {
-                            println!("  {} vout:{} = {} atoms",
+                            println!(
+                                "  {} vout:{} = {} atoms",
                                 hex::encode(&outpoint.txid[..8]),
                                 outpoint.vout,
                                 txout.value_atoms
@@ -213,23 +226,8 @@ async fn main() -> Result<()> {
                 // Fetch UTXOs from the address index
                 let utxos = db.get_utxos_by_address(&address.0)?;
                 let balance_atoms: u64 = utxos.iter().map(|(_, txout)| txout.value_atoms).sum();
-                let utxo_count = utxos.len();
 
-                println!("\n=== Address Balance ===");
-                println!("Address: {}", address);
-                println!("Balance: {} NULLA ({} atoms)", nulla_wallet::atoms_to_nulla(balance_atoms), balance_atoms);
-                println!("UTXOs:   {}", utxo_count);
-
-                if !utxos.is_empty() {
-                    println!("\nUTXO Details:");
-                    for (outpoint, txout) in utxos {
-                        println!("  {} vout:{} = {} atoms",
-                            hex::encode(&outpoint.txid[..8]),
-                            outpoint.vout,
-                            txout.value_atoms
-                        );
-                    }
-                }
+                println!("\n{} NULLA", nulla_wallet::atoms_to_nulla(balance_atoms));
 
                 return Ok(());
             }
@@ -318,7 +316,10 @@ async fn main() -> Result<()> {
         if selected_value < amount_atoms {
             let balance = nulla_wallet::atoms_to_nulla(selected_value);
             eprintln!("Error: Insufficient balance");
-            eprintln!("Available: {} NULLA, Required: {} NULLA", balance, amount_nulla);
+            eprintln!(
+                "Available: {} NULLA, Required: {} NULLA",
+                balance, amount_nulla
+            );
             std::process::exit(1);
         }
 
@@ -328,8 +329,8 @@ async fn main() -> Result<()> {
             .iter()
             .map(|(outpoint, _)| TxIn {
                 prevout: outpoint.clone(),
-                sig: vec![],     // Will be filled by wallet
-                pubkey: vec![],  // Will be filled by wallet
+                sig: vec![],    // Will be filled by wallet
+                pubkey: vec![], // Will be filled by wallet
             })
             .collect();
 
@@ -383,7 +384,11 @@ async fn main() -> Result<()> {
         println!("To:     {}", recipient);
         println!("Amount: {} NULLA ({} atoms)", amount_nulla, amount_atoms);
         if change > 0 {
-            println!("Change: {} NULLA ({} atoms)", nulla_wallet::atoms_to_nulla(change), change);
+            println!(
+                "Change: {} NULLA ({} atoms)",
+                nulla_wallet::atoms_to_nulla(change),
+                change
+            );
         }
         println!("TxID:   {}", hex::encode(txid));
         println!("\nBroadcasting transaction to peers...");
@@ -416,7 +421,10 @@ async fn main() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         // Broadcast the full transaction to the network.
-        handle.commands.send(nulla_net::NetworkCommand::PublishFullTx { tx }).await?;
+        handle
+            .commands
+            .send(nulla_net::NetworkCommand::PublishFullTx { tx })
+            .await?;
 
         println!("Transaction broadcasted successfully!");
         println!("\nThe transaction will be included in the next block.");
@@ -470,8 +478,18 @@ async fn main() -> Result<()> {
     let listen_addrs = parse_multiaddrs(&args.listen)?;
     let peer_addrs = parse_multiaddrs(&args.peers)?;
 
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = signal::ctrl_c().await;
+            shutdown.store(true, Ordering::SeqCst);
+        });
+    }
+
     // Determine if gossip should be enabled (default true unless --no-gossip is set).
-    let gossip_enabled = !args.no_gossip && (args.gossip || args.listen.is_empty() || !args.listen.is_empty());
+    let gossip_enabled =
+        !args.no_gossip && (args.gossip || args.listen.is_empty() || !args.listen.is_empty());
 
     // Determine if Dandelion++ should be enabled (default true unless --no-dandelion is set).
     let dandelion_enabled = !args.no_dandelion && (args.dandelion || true);
@@ -513,7 +531,14 @@ async fn main() -> Result<()> {
             if coinbase_addr.is_none() {
                 warn!("mining enabled but no address provided; use --miner-address or --wallet-seed to receive block rewards");
             }
-            spawn_miner_real(chain_id, cmd_tx.clone(), db.clone(), handle.local_peer_id, coinbase_addr)?;
+            spawn_miner_real(
+                chain_id,
+                cmd_tx.clone(),
+                db.clone(),
+                handle.local_peer_id,
+                coinbase_addr,
+                shutdown.clone(),
+            )?;
         }
     } else {
         info!("gossip stack disabled; node running in local-only mode");
@@ -602,10 +627,15 @@ async fn handle_network_events(
                     continue;
                 }
 
-                info!("transaction {} added to mempool, relaying to peers", hex::encode(txid));
+                info!(
+                    "transaction {} added to mempool, relaying to peers",
+                    hex::encode(txid)
+                );
 
                 // Relay the transaction to all other peers (gossip protocol)
-                let _ = cmd_tx.send(nulla_net::NetworkCommand::PublishFullTx { tx }).await;
+                let _ = cmd_tx
+                    .send(nulla_net::NetworkCommand::PublishFullTx { tx })
+                    .await;
             }
             NetworkEvent::BlockInv { from, header } => {
                 let block_id = nulla_core::block_header_id(&header);
@@ -644,10 +674,15 @@ async fn handle_network_events(
                     Ok(Some((tip_id, tip_height, tip_work))) => {
                         // If this block builds on our tip, update the tip.
                         if header.prev == tip_id && header.height == tip_height + 1 {
-                            if let Err(e) = db.set_best_tip(&block_id, header.height, cumulative_work) {
+                            if let Err(e) =
+                                db.set_best_tip(&block_id, header.height, cumulative_work)
+                            {
                                 warn!("failed to update best tip: {e}");
                             } else {
-                                info!("updated best tip to height {} (work: {})", header.height, cumulative_work);
+                                info!(
+                                    "updated best tip to height {} (work: {})",
+                                    header.height, cumulative_work
+                                );
 
                                 // Update progress bar if syncing.
                                 let mut progress_lock = sync_progress.lock().await;
@@ -667,7 +702,9 @@ async fn handle_network_events(
                             );
 
                             // Update to the chain with most work.
-                            if let Err(e) = db.set_best_tip(&block_id, header.height, cumulative_work) {
+                            if let Err(e) =
+                                db.set_best_tip(&block_id, header.height, cumulative_work)
+                            {
                                 warn!("failed to update best tip: {e}");
                             } else {
                                 info!("switched to new best chain at height {}", header.height);
@@ -796,10 +833,15 @@ async fn handle_network_events(
                 match db.best_tip() {
                     Ok(Some((tip_id, tip_height, tip_work))) => {
                         if block.header.prev == tip_id && block.header.height == tip_height + 1 {
-                            if let Err(e) = db.set_best_tip(&block_id, block.header.height, cumulative_work) {
+                            if let Err(e) =
+                                db.set_best_tip(&block_id, block.header.height, cumulative_work)
+                            {
                                 warn!("failed to update best tip: {e}");
                             } else {
-                                info!("updated best tip to height {} (work: {})", block.header.height, cumulative_work);
+                                info!(
+                                    "updated best tip to height {} (work: {})",
+                                    block.header.height, cumulative_work
+                                );
 
                                 // Update progress bar
                                 let mut progress_lock = sync_progress.lock().await;
@@ -816,10 +858,15 @@ async fn handle_network_events(
                                 "received chain with more work (our: {}, theirs: {}), height: {}",
                                 tip_work, cumulative_work, block.header.height
                             );
-                            if let Err(e) = db.set_best_tip(&block_id, block.header.height, cumulative_work) {
+                            if let Err(e) =
+                                db.set_best_tip(&block_id, block.header.height, cumulative_work)
+                            {
                                 warn!("failed to update best tip: {e}");
                             } else {
-                                info!("switched to new best chain at height {}", block.header.height);
+                                info!(
+                                    "switched to new best chain at height {}",
+                                    block.header.height
+                                );
                             }
                         } else if block.header.height > tip_height {
                             let blocks_behind = block.header.height - tip_height;
@@ -885,13 +932,11 @@ fn handle_request(db: &NullaDb, req: protocol::Req) -> protocol::Resp {
         protocol::Req::GetTip => {
             // Return the best known tip.
             match db.best_tip() {
-                Ok(Some((id, height, cumulative_work))) => {
-                    protocol::Resp::Tip {
-                        height,
-                        id,
-                        cumulative_work,
-                    }
-                }
+                Ok(Some((id, height, cumulative_work))) => protocol::Resp::Tip {
+                    height,
+                    id,
+                    cumulative_work,
+                },
                 _ => protocol::Resp::Err { code: 404 },
             }
         }
@@ -959,10 +1004,7 @@ fn handle_request(db: &NullaDb, req: protocol::Req) -> protocol::Resp {
 /// Every 60 seconds, this task:
 /// - Logs current chain state
 /// - Ensures peers are kept in sync via gossipsub
-async fn periodic_peer_sync(
-    _cmd_tx: async_channel::Sender<NetworkCommand>,
-    db: NullaDb,
-) {
+async fn periodic_peer_sync(_cmd_tx: async_channel::Sender<NetworkCommand>, db: NullaDb) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
@@ -1024,8 +1066,12 @@ fn spawn_seed(
 
             match db.best_tip() {
                 Ok(Some((tip_id, height, work))) => {
-                    info!("seed: synced to height {} (tip: {}, work: {})",
-                          height, hex::encode(&tip_id[..8]), work);
+                    info!(
+                        "seed: synced to height {} (tip: {}, work: {})",
+                        height,
+                        hex::encode(&tip_id[..8]),
+                        work
+                    );
                 }
                 Ok(None) => {
                     info!("seed: waiting for blockchain data from peers...");
@@ -1053,6 +1099,7 @@ fn spawn_miner_real(
     db: NullaDb,
     local_peer_id: libp2p::PeerId,
     coinbase_addr: Option<nulla_wallet::Address>,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     tokio::spawn(async move {
         info!("miner started (peer_id: {local_peer_id})");
@@ -1065,6 +1112,10 @@ fn spawn_miner_real(
         }
 
         loop {
+            if shutdown.load(Ordering::Relaxed) {
+                info!("miner: shutdown requested");
+                break;
+            }
             // Get the current best tip from the database.
             let (prev_id, prev_height, prev_work) = match db.best_tip() {
                 Ok(Some((id, height, work))) => {
@@ -1116,7 +1167,10 @@ fn spawn_miner_real(
             // Include transactions from the mempool
             match db.get_mempool_txs() {
                 Ok(mempool_txs) if !mempool_txs.is_empty() => {
-                    info!("miner: including {} transaction(s) from mempool", mempool_txs.len());
+                    info!(
+                        "miner: including {} transaction(s) from mempool",
+                        mempool_txs.len()
+                    );
                     txs.extend(mempool_txs);
                 }
                 Ok(_) => {
@@ -1131,41 +1185,118 @@ fn spawn_miner_real(
             let txids: Vec<Hash32> = txs.iter().map(nulla_core::tx_id).collect();
             let merkle_root = nulla_core::merkle_root(&txids);
 
-            // Set mining difficulty target (easier than Bitcoin for testing)
+            // Set mining difficulty target (requires multiple leading zero bits)
             let mut target = [0xffu8; 32];
-            target[0] = 0x0f;  // First byte must be less than 0x0f (moderate difficulty)
+            target[0] = 0x00; // First byte must be 0x00
+            target[1] = 0x00; // Second byte must be 0x00
+            target[2] = 0x00; // Third byte must be 0x00
+            target[3] = 0x33; // Fourth byte capped (~5x harder than 24-bit)
 
-            // Mine for a valid nonce
-            info!("miner: mining block at height {}...", next_height);
-            let mut nonce: u64 = 0;
-            let (header, block_id) = loop {
-                let header = nulla_core::BlockHeader {
-                    chain_id,
-                    version: 1,
-                    height: next_height,
-                    prev: prev_id,
-                    merkle_root,
-                    timestamp: chrono::Utc::now().timestamp() as u64,
-                    target,
-                    nonce,
-                };
+            // Mine for a valid nonce using all available CPU threads
+            // Use all available threads, with a sensible minimum so even small systems
+            // still get a decent amount of parallelism (e.g., low-core VMs).
+            let worker_count = std::thread::available_parallelism()
+                .map(|n| n.get().max(16))
+                .unwrap_or(16);
+            info!(
+                "miner: mining block at height {} with {} workers...",
+                next_height, worker_count
+            );
 
-                let temp_block = Block { header: header.clone(), txs: txs.clone() };
-                let temp_block_id = nulla_core::block_id(&temp_block);
+            let stop = Arc::new(AtomicBool::new(false));
+            let nonce_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (found_tx, found_rx) = std::sync::mpsc::channel();
+            let mut handles = Vec::with_capacity(worker_count);
 
-                // Check if block hash meets target
-                if temp_block_id[0] < target[0] {
-                    info!("miner: found valid block! nonce={} hash={}", nonce, hex::encode(temp_block_id));
-                    break (header, temp_block_id);
-                }
-
-                nonce += 1;
-                if nonce % 100000 == 0 {
-                    info!("miner: tried {} nonces...", nonce);
-                }
+            // Base header shared by workers (each mutates the nonce)
+            let base_header = nulla_core::BlockHeader {
+                chain_id,
+                version: 1,
+                height: next_height,
+                prev: prev_id,
+                merkle_root,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                target,
+                nonce: 0,
             };
 
-            let block = Block { header: header.clone(), txs };
+            let stride = worker_count as u64;
+
+            // Heartbeat logger to show progress across all workers
+            {
+                let stop_flag = stop.clone();
+                let shutdown_flag = shutdown.clone();
+                let counter = nonce_counter.clone();
+                std::thread::spawn(move || {
+                    let mut last = 0;
+                    loop {
+                        std::thread::sleep(Duration::from_secs(1));
+                        let current = counter.load(Ordering::Relaxed);
+                        let delta = current.saturating_sub(last);
+                        last = current;
+                        info!(
+                            "miner: tried {} nonces (+{} last 1s, ~{} H/s)...",
+                            current, delta, delta
+                        );
+                        if stop_flag.load(Ordering::Relaxed)
+                            || shutdown_flag.load(Ordering::Relaxed)
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            for worker_id in 0..worker_count {
+                let stop_flag = stop.clone();
+                let shutdown_flag = shutdown.clone();
+                let tx_found = found_tx.clone();
+                let mut header = base_header.clone();
+                header.nonce = worker_id as u64;
+                let counter = nonce_counter.clone();
+
+                handles.push(std::thread::spawn(move || {
+                    let mut nonce = header.nonce;
+                    while !stop_flag.load(Ordering::Relaxed)
+                        && !shutdown_flag.load(Ordering::Relaxed)
+                    {
+                        header.nonce = nonce;
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        if nulla_core::validate_pow(&header).is_ok() {
+                            let _ = tx_found.send(header.clone());
+                            stop_flag.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        nonce = nonce.wrapping_add(stride);
+                    }
+                }));
+            }
+            drop(found_tx);
+
+            let header = match found_rx.recv() {
+                Ok(h) => h,
+                Err(_) => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        info!("miner: shutdown requested");
+                    }
+                    stop.store(true, Ordering::SeqCst);
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                    break;
+                }
+            };
+            stop.store(true, Ordering::SeqCst);
+            for handle in handles {
+                let _ = handle.join();
+            }
+
+            let block_id = nulla_core::block_header_id(&header);
+
+            let block = Block {
+                header: header.clone(),
+                txs,
+            };
 
             // Calculate cumulative work.
             let block_work = nulla_core::target_work(&header.target);
@@ -1210,7 +1341,9 @@ fn spawn_miner_real(
             }
 
             // Broadcast the full block to the network (includes transactions).
-            let _ = cmd_tx.send(NetworkCommand::PublishFullBlock { block }).await;
+            let _ = cmd_tx
+                .send(NetworkCommand::PublishFullBlock { block })
+                .await;
         }
     });
     Ok(())

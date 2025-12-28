@@ -98,7 +98,8 @@ impl NullaDb {
     pub fn set_best_tip(&self, id: &Hash32, height: u64, cumulative_work: u128) -> Result<()> {
         self.meta.insert(META_BEST_TIP, id)?;
         self.meta.insert(META_BEST_HEIGHT, &height.to_be_bytes())?;
-        self.meta.insert(META_BEST_WORK, &cumulative_work.to_be_bytes())?;
+        self.meta
+            .insert(META_BEST_WORK, &cumulative_work.to_be_bytes())?;
         Ok(())
     }
 
@@ -189,10 +190,8 @@ impl NullaDb {
 
     /// Add a UTXO to the set and index by address.
     pub fn put_utxo(&self, out: &OutPoint, txout: &TxOut) -> Result<()> {
-        self.utxos.insert(
-            bincode::serialize(out)?,
-            bincode::serialize(txout)?,
-        )?;
+        self.utxos
+            .insert(bincode::serialize(out)?, bincode::serialize(txout)?)?;
 
         // Extract address from script_pubkey and index this UTXO
         if let Some(addr_bytes) = extract_address_bytes(&txout.script_pubkey) {
@@ -341,13 +340,11 @@ impl NullaDb {
                 )));
             }
 
-            total_input = total_input
-                .checked_add(utxo.value_atoms)
-                .ok_or_else(|| {
-                    DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
-                        "Input value overflow".to_string(),
-                    )))
-                })?;
+            total_input = total_input.checked_add(utxo.value_atoms).ok_or_else(|| {
+                DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
+                    "Input value overflow".to_string(),
+                )))
+            })?;
         }
 
         Ok(total_input)
@@ -374,7 +371,9 @@ impl NullaDb {
                 Some(output) => output,
                 None => {
                     return Err(DbError::Serde(bincode::Error::new(
-                        bincode::ErrorKind::Custom("UTXO not found for signature verification".to_string()),
+                        bincode::ErrorKind::Custom(
+                            "UTXO not found for signature verification".to_string(),
+                        ),
                     )));
                 }
             };

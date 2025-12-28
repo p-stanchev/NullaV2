@@ -13,9 +13,7 @@ use std::time::Duration;
 use async_channel::{Receiver, Sender};
 use futures::prelude::*;
 use libp2p::{
-    identify, noise, ping,
-    swarm::SwarmEvent,
-    tcp, Multiaddr, PeerId, Swarm, SwarmBuilder,
+    identify, noise, ping, swarm::SwarmEvent, tcp, Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
 use thiserror::Error;
 use tokio::select;
@@ -204,12 +202,7 @@ pub mod dandelion {
         }
 
         /// Handle an incoming stem transaction from another peer.
-        pub fn on_stem(
-            &mut self,
-            txid: Hash32,
-            hops_left: u8,
-            connected: &[PeerId],
-        ) -> Action {
+        pub fn on_stem(&mut self, txid: Hash32, hops_left: u8, connected: &[PeerId]) -> Action {
             if self.seen.contains(&txid) {
                 return Action::Drop;
             }
@@ -291,7 +284,10 @@ pub enum NetworkCommand {
     /// Send a request to a peer.
     SendRequest { peer: PeerId, req: protocol::Req },
     /// Send a response to a peer.
-    SendResponse { channel: ResponseChannel, resp: protocol::Resp },
+    SendResponse {
+        channel: ResponseChannel,
+        resp: protocol::Resp,
+    },
 }
 
 /// Events emitted by the network task.
@@ -362,8 +358,7 @@ pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError>
             .map_err(|e| anyhow::anyhow!("listen error: {e}"))?;
     }
     for peer in &config.peers {
-        Swarm::dial(&mut swarm, peer.clone())
-            .map_err(|e| anyhow::anyhow!("dial error: {e}"))?;
+        Swarm::dial(&mut swarm, peer.clone()).map_err(|e| anyhow::anyhow!("dial error: {e}"))?;
     }
 
     // Bootstrap Kademlia DHT if we have initial peers.

@@ -232,7 +232,8 @@ pub fn validate_tx_structure(tx: &Tx) -> Result<(), ValidationError> {
     // Check that output values don't overflow
     let mut total: u64 = 0;
     for output in &tx.outputs {
-        total = total.checked_add(output.value_atoms)
+        total = total
+            .checked_add(output.value_atoms)
             .ok_or(ValidationError::ValueOverflow)?;
     }
 
@@ -259,7 +260,8 @@ pub fn validate_coinbase(tx: &Tx) -> Result<(), ValidationError> {
     // Check that output values don't overflow
     let mut total: u64 = 0;
     for output in &tx.outputs {
-        total = total.checked_add(output.value_atoms)
+        total = total
+            .checked_add(output.value_atoms)
             .ok_or(ValidationError::ValueOverflow)?;
     }
 

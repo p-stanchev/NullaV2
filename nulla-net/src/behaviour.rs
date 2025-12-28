@@ -1,8 +1,6 @@
 //! libp2p NetworkBehaviour composition and configuration.
 
-use libp2p::{
-    gossipsub, identify, identity, kad, ping, swarm::NetworkBehaviour, PeerId,
-};
+use libp2p::{gossipsub, identify, identity, kad, ping, swarm::NetworkBehaviour, PeerId};
 use std::io;
 
 use crate::protocol;
@@ -41,22 +39,24 @@ pub fn build_behaviour(
     // Subscribe to transaction and block topics.
     let tx_topic = gossipsub::IdentTopic::new(protocol::topic_inv_tx(chain_id));
     let block_topic = gossipsub::IdentTopic::new(protocol::topic_inv_block(chain_id));
-    gossipsub.subscribe(&tx_topic).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        Box::new(io::Error::new(io::ErrorKind::Other, e))
-    })?;
-    gossipsub.subscribe(&block_topic).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        Box::new(io::Error::new(io::ErrorKind::Other, e))
-    })?;
+    gossipsub
+        .subscribe(&tx_topic)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(io::Error::new(io::ErrorKind::Other, e))
+        })?;
+    gossipsub
+        .subscribe(&block_topic)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(io::Error::new(io::ErrorKind::Other, e))
+        })?;
 
     // Configure Kademlia DHT for peer discovery.
     let store = kad::store::MemoryStore::new(peer_id);
     let kad = kad::Behaviour::new(peer_id, store);
 
     // Configure Identify protocol for peer information exchange.
-    let identify = identify::Behaviour::new(identify::Config::new(
-        "/nulla/1".into(),
-        keypair.public(),
-    ));
+    let identify =
+        identify::Behaviour::new(identify::Config::new("/nulla/1".into(), keypair.public()));
 
     Ok(Behaviour {
         identify,

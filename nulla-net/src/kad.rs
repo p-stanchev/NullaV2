@@ -6,10 +6,7 @@ use tracing::info;
 use crate::NetworkEvent;
 
 /// Handle a Kademlia DHT event and emit network events for peer discovery.
-pub async fn handle_kad_event(
-    kad_event: kad::Event,
-    evt_tx: &async_channel::Sender<NetworkEvent>,
-) {
+pub async fn handle_kad_event(kad_event: kad::Event, evt_tx: &async_channel::Sender<NetworkEvent>) {
     match kad_event {
         kad::Event::RoutingUpdated { peer, .. } => {
             info!("kad: routing updated with peer {peer}");
