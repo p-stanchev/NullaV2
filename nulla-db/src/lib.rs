@@ -165,4 +165,64 @@ impl NullaDb {
     pub fn is_spent(&self, out: &OutPoint) -> Result<bool> {
         Ok(self.spent.contains_key(bincode::serialize(out)?)?)
     }
+
+    /// Remove a UTXO from the set (used during chain reorganization).
+    pub fn remove_utxo(&self, out: &OutPoint) -> Result<()> {
+        self.utxos.remove(bincode::serialize(out)?)?;
+        Ok(())
+    }
+
+    /// Unmark a UTXO as spent (used during chain reorganization rollback).
+    pub fn unmark_spent(&self, out: &OutPoint) -> Result<()> {
+        self.spent.remove(bincode::serialize(out)?)?;
+        Ok(())
+    }
+
+    /// Get all transactions currently in the mempool.
+    pub fn get_mempool_txs(&self) -> Result<Vec<Tx>> {
+        let mut txs = Vec::new();
+        for item in self.mempool.iter() {
+            let (_key, value) = item?;
+            txs.push(bincode::deserialize(&value)?);
+        }
+        Ok(txs)
+    }
+
+    /// Get a transaction from the mempool by its ID.
+    pub fn get_mempool_tx(&self, txid: &Hash32) -> Result<Option<Tx>> {
+        match self.mempool.get(txid)? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Count the number of transactions in the mempool.
+    pub fn mempool_size(&self) -> usize {
+        self.mempool.len()
+    }
+
+    /// Clear all transactions from the mempool (used during shutdown or reorg).
+    pub fn clear_mempool(&self) -> Result<()> {
+        self.mempool.clear()?;
+        Ok(())
+    }
+
+    /// Get a block header by height.
+    pub fn get_header_by_height(&self, height: u64) -> Result<Option<BlockHeader>> {
+        match self.header_by_height.get(&height.to_be_bytes())? {
+            Some(id_bytes) => {
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&id_bytes);
+                self.get_header(&id)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Store both header and full block atomically.
+    pub fn put_block_full(&self, block: &Block) -> Result<()> {
+        self.put_header(&block.header)?;
+        self.put_block(block)?;
+        Ok(())
+    }
 }

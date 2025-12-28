@@ -92,6 +92,42 @@ cargo run -p nulla-node -- --listen /ip4/0.0.0.0/tcp/27444 --mine
 
 The miner broadcasts dummy blocks every 30 seconds for testing purposes.
 
+### Running on a VPS
+
+To run a public seed node on a VPS that others can connect to:
+
+**On your VPS (seed node):**
+```bash
+# Build in release mode for better performance
+cargo build --release
+
+# Run the node, listening on all interfaces
+./target/release/nulla --listen /ip4/0.0.0.0/tcp/27444
+
+# With mining enabled
+./target/release/nulla --listen /ip4/0.0.0.0/tcp/27444 --mine
+```
+
+**On your local machine (connecting to VPS):**
+```bash
+# Replace YOUR_VPS_IP with your server's public IP address
+cargo run -p nulla-node -- --peers /ip4/YOUR_VPS_IP/tcp/27444
+```
+
+> **Note:** You only need `--db ./data2` when running multiple nodes on the **same machine**. Different machines can all use the default `./data` directory.
+
+**Important networking notes:**
+- Make sure port `27444` is open in your firewall (or use a different port)
+- If using a cloud provider (AWS, DigitalOcean, etc.), configure security groups to allow TCP traffic on port 27444
+- The node will log "listening on" and "peer connected" messages when successful
+- You can run multiple local nodes connecting to the same VPS seed node
+
+**Example with firewall (Ubuntu/Debian):**
+```bash
+sudo ufw allow 27444/tcp
+sudo ufw reload
+```
+
 ## Command-Line Options
 
 ### Network Configuration
@@ -132,14 +168,18 @@ The miner broadcasts dummy blocks every 30 seconds for testing purposes.
 - [x] Dandelion++ transaction privacy protocol
 - [x] Peer discovery via Kademlia DHT
 - [x] Basic stub miner for testing
+- [x] Request/response handlers for block sync
+- [x] Cover traffic implementation
+- [x] Transaction validation and structure checking
+- [x] Mempool management (add, remove, query, clear)
+- [x] Chain reorganization support (UTXO rollback, reorg helpers)
 
 ### In Progress 🚧
 
-- [ ] Request/response handlers for block sync
-- [ ] Cover traffic implementation
-- [ ] Transaction validation and script execution
-- [ ] Mempool management
-- [ ] Chain reorganization logic
+- [ ] Full script execution and signature verification
+- [ ] Difficulty adjustment algorithm
+- [ ] Proper chain selection (most work, not just longest)
+- [ ] Complete block synchronization protocol
 
 ### Planned 📋
 

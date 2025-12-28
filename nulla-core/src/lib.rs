@@ -94,6 +94,18 @@ pub enum ValidationError {
     InvalidPow,
     #[error("empty block")]
     EmptyBlock,
+    #[error("empty inputs")]
+    EmptyInputs,
+    #[error("empty outputs")]
+    EmptyOutputs,
+    #[error("duplicate input")]
+    DuplicateInput,
+    #[error("invalid signature")]
+    InvalidSignature,
+    #[error("insufficient value")]
+    InsufficientValue,
+    #[error("output value overflow")]
+    ValueOverflow,
 }
 
 /// Compute the transaction ID by hashing the serialized transaction with BLAKE3.
@@ -164,13 +176,52 @@ pub fn target_work(target: &Hash32) -> u128 {
     u128::MAX / value
 }
 
+/// Validate basic transaction structure (not checking signatures or UTXO availability).
+///
+/// Checks:
+/// - Transaction has at least one input and one output
+/// - No duplicate inputs
+/// - Output values don't overflow
+pub fn validate_tx_structure(tx: &Tx) -> Result<(), ValidationError> {
+    if tx.inputs.is_empty() {
+        return Err(ValidationError::EmptyInputs);
+    }
+    if tx.outputs.is_empty() {
+        return Err(ValidationError::EmptyOutputs);
+    }
+
+    // Check for duplicate inputs
+    let mut seen = std::collections::HashSet::new();
+    for input in &tx.inputs {
+        let key = (&input.prevout.txid, input.prevout.vout);
+        if !seen.insert(key) {
+            return Err(ValidationError::DuplicateInput);
+        }
+    }
+
+    // Check that output values don't overflow
+    let mut total: u64 = 0;
+    for output in &tx.outputs {
+        total = total.checked_add(output.value_atoms)
+            .ok_or(ValidationError::ValueOverflow)?;
+    }
+
+    Ok(())
+}
+
 /// Validate a complete block, checking:
 /// - The block contains at least one transaction
 /// - The merkle root matches the computed root of all transaction IDs
 /// - The proof-of-work is valid
+/// - Basic transaction structure for all transactions
 pub fn validate_block(block: &Block) -> Result<(), ValidationError> {
     if block.txs.is_empty() {
         return Err(ValidationError::EmptyBlock);
+    }
+
+    // Validate all transaction structures
+    for tx in &block.txs {
+        validate_tx_structure(tx)?;
     }
 
     let txids: Vec<Hash32> = block.txs.iter().map(tx_id).collect();

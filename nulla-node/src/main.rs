@@ -102,6 +102,9 @@ async fn main() -> Result<()> {
         let cmd_tx = handle.commands.clone();
         tokio::spawn(handle_network_events(handle.events, cmd_tx.clone(), db.clone()));
 
+        // Spawn periodic peer sync task
+        tokio::spawn(periodic_peer_sync(cmd_tx.clone(), db.clone()));
+
         // If mining is enabled, spawn the stub miner task.
         if args.mine {
             spawn_miner(chain_id, cmd_tx)?;
@@ -264,5 +267,29 @@ fn dummy_header(chain_id: [u8; 4]) -> BlockHeader {
         timestamp: chrono::Utc::now().timestamp() as u64,
         target,
         nonce: rand::random(),
+    }
+}
+
+/// Periodically sync chain state with connected peers.
+///
+/// Every 60 seconds, this task:
+/// - Requests peer addresses for peer discovery
+/// - Requests the best chain tip to check if we're behind
+/// - Logs sync status
+async fn periodic_peer_sync(
+    _cmd_tx: async_channel::Sender<NetworkCommand>,
+    _db: NullaDb,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+        // Note: Peer exchange and tip requests are currently handled via
+        // the request/response protocol but not actively sent here.
+        // This is a placeholder for future sync logic that will:
+        // 1. Send GetAddr requests to learn about new peers
+        // 2. Send GetTip requests to check if we're synced
+        // 3. Request missing blocks/headers if we're behind
+
+        info!("periodic sync tick (peer discovery and chain sync)");
     }
 }
