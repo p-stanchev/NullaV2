@@ -56,6 +56,8 @@ pub mod protocol {
         InvBlock { header: BlockHeader },
         /// Full block broadcast (for small networks, includes all transactions).
         FullBlock { block: Block },
+        /// Full transaction broadcast (includes complete transaction data).
+        FullTx { tx: Tx },
         /// Cover traffic noise message for network privacy.
         Noise { bytes: [u8; 32] },
     }
@@ -280,6 +282,8 @@ pub enum NetworkCommand {
     Dial(Multiaddr),
     /// Publish a transaction to the network.
     PublishTx { txid: Hash32 },
+    /// Publish a full transaction to the network (includes transaction data).
+    PublishFullTx { tx: nulla_core::Tx },
     /// Publish a block to the network.
     PublishBlock { header: BlockHeader },
     /// Publish a full block to the network (includes all transactions).
@@ -295,6 +299,8 @@ pub enum NetworkCommand {
 pub enum NetworkEvent {
     /// Received a transaction inventory announcement.
     TxInv { from: PeerId, txid: Hash32 },
+    /// Received a full transaction.
+    FullTx { from: PeerId, tx: nulla_core::Tx },
     /// Received a block inventory announcement.
     BlockInv { from: PeerId, header: BlockHeader },
     /// Received a full block.
@@ -489,6 +495,9 @@ fn apply_command(swarm: &mut Swarm<Behaviour>, command: NetworkCommand, chain_id
         }
         NetworkCommand::PublishTx { txid } => {
             gossip::publish_tx(swarm, chain_id, txid);
+        }
+        NetworkCommand::PublishFullTx { tx } => {
+            gossip::publish_full_tx(swarm, chain_id, tx);
         }
         NetworkCommand::PublishBlock { header } => {
             gossip::publish_block(swarm, header);

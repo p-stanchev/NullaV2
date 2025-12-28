@@ -3,13 +3,22 @@
 use libp2p::{gossipsub, PeerId, Swarm};
 use tracing::info;
 
-use nulla_core::{Block, BlockHeader, Hash32};
+use nulla_core::{Block, BlockHeader, Hash32, Tx};
 
 use crate::{behaviour::Behaviour, protocol};
 
 /// Publish a transaction inventory announcement to the network.
 pub fn publish_tx(swarm: &mut Swarm<Behaviour>, chain_id: [u8; 4], txid: Hash32) {
     let msg = protocol::GossipMsg::InvTx { txid };
+    if let Ok(data) = postcard::to_allocvec(&msg) {
+        let topic = gossipsub::IdentTopic::new(protocol::topic_inv_tx(&chain_id));
+        let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
+    }
+}
+
+/// Publish a full transaction to the network (includes transaction data).
+pub fn publish_full_tx(swarm: &mut Swarm<Behaviour>, chain_id: [u8; 4], tx: Tx) {
+    let msg = protocol::GossipMsg::FullTx { tx };
     if let Ok(data) = postcard::to_allocvec(&msg) {
         let topic = gossipsub::IdentTopic::new(protocol::topic_inv_tx(&chain_id));
         let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
@@ -62,6 +71,14 @@ pub async fn handle_gossip_message(
                     .send(crate::NetworkEvent::TxInv {
                         from: propagation_source,
                         txid,
+                    })
+                    .await;
+            }
+            protocol::GossipMsg::FullTx { tx } => {
+                let _ = evt_tx
+                    .send(crate::NetworkEvent::FullTx {
+                        from: propagation_source,
+                        tx,
                     })
                     .await;
             }

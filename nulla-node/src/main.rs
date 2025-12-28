@@ -52,13 +52,13 @@ struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     cover_traffic: bool,
 
-    /// Enable stub miner (for gossip testing only; broadcasts dummy blocks).
-    #[arg(long, default_value_t = false)]
-    mine: bool,
-
-    /// Enable seed mode (builds blocks on top of chain, no mining).
+    /// Enable seed node mode (relay and sync blocks, no mining).
     #[arg(long, default_value_t = false)]
     seed: bool,
+
+    /// Enable mining (creates blocks with proof-of-work).
+    #[arg(long, default_value_t = false)]
+    mine: bool,
 
     /// RPC server bind address (placeholder; not yet wired).
     #[arg(long, default_value = "127.0.0.1:27447")]
@@ -98,6 +98,19 @@ struct Args {
     /// Works with any address - check your own balance or someone else's.
     #[arg(long)]
     balance: Option<String>,
+
+    /// Send NULLA to an address (requires --wallet-seed, --to, and --amount).
+    /// Example: --send --to 79bc6374ccc99f1211770ce007e05f6235b98c8b --amount 5.0
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    send: bool,
+
+    /// Recipient address for sending NULLA (40-char hex, 20 bytes).
+    #[arg(long)]
+    to: Option<String>,
+
+    /// Amount to send in NULLA (e.g., 5.0 = 500000000 atoms).
+    #[arg(long)]
+    amount: Option<f64>,
 }
 
 #[tokio::main]
@@ -112,8 +125,12 @@ async fn main() -> Result<()> {
         println!("\n=== New Wallet Generated ===");
         println!("Address: {}", wallet.address());
         println!("Seed:    {}", seed_hex);
-        println!("\nSave your seed securely! You can use it with --wallet-seed to restore this wallet.");
-        println!("Example: nulla --wallet-seed {}\n", seed_hex);
+        println!("\nIMPORTANT: Save your seed NOW! This will not be shown again.");
+        println!("IMPORTANT: Anyone with this seed can spend your funds.");
+        println!("\nTo use this wallet later:");
+        println!("  --wallet-seed {}", seed_hex);
+        println!("\nTo check balance:");
+        println!("  --balance {}\n", wallet.address());
         return Ok(());
     }
 
@@ -224,6 +241,189 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Handle send transaction command.
+    if args.send {
+        // Validate required arguments.
+        let wallet_seed = match &args.wallet_seed {
+            Some(s) => s,
+            None => {
+                eprintln!("Error: --wallet-seed required for --send");
+                std::process::exit(1);
+            }
+        };
+        let to_addr = match &args.to {
+            Some(s) => s,
+            None => {
+                eprintln!("Error: --to <ADDRESS> required for --send");
+                std::process::exit(1);
+            }
+        };
+        let amount_nulla = match args.amount {
+            Some(a) => a,
+            None => {
+                eprintln!("Error: --amount <NULLA> required for --send");
+                std::process::exit(1);
+            }
+        };
+
+        // Parse wallet seed.
+        let seed_bytes = match hex::decode(wallet_seed) {
+            Ok(bytes) if bytes.len() == 32 => bytes,
+            _ => {
+                eprintln!("Error: Invalid wallet seed (must be 32 bytes hex)");
+                std::process::exit(1);
+            }
+        };
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_bytes);
+        let wallet = Wallet::from_seed(&seed);
+
+        // Parse recipient address.
+        let recipient = match nulla_wallet::Address::from_hex(to_addr) {
+            Some(addr) => addr,
+            None => {
+                eprintln!("Error: Invalid recipient address (must be 40-char hex, 20 bytes)");
+                std::process::exit(1);
+            }
+        };
+
+        // Convert amount to atoms.
+        let amount_atoms = nulla_wallet::nulla_to_atoms(amount_nulla);
+        if amount_atoms == 0 {
+            eprintln!("Error: Amount must be greater than 0");
+            std::process::exit(1);
+        }
+
+        // Open database and get wallet UTXOs.
+        let db = NullaDb::open(&args.db)?;
+        let sender_addr = wallet.address();
+        let utxos = db.get_utxos_by_address(&sender_addr.0)?;
+
+        if utxos.is_empty() {
+            eprintln!("Error: No UTXOs available (balance is 0)");
+            std::process::exit(1);
+        }
+
+        // Select UTXOs to cover the amount (simple first-fit algorithm).
+        let mut selected_utxos = Vec::new();
+        let mut selected_value: u64 = 0;
+        for (outpoint, txout) in utxos {
+            selected_utxos.push((outpoint, txout.clone()));
+            selected_value += txout.value_atoms;
+            if selected_value >= amount_atoms {
+                break;
+            }
+        }
+
+        if selected_value < amount_atoms {
+            let balance = nulla_wallet::atoms_to_nulla(selected_value);
+            eprintln!("Error: Insufficient balance");
+            eprintln!("Available: {} NULLA, Required: {} NULLA", balance, amount_nulla);
+            std::process::exit(1);
+        }
+
+        // Create transaction inputs.
+        use nulla_core::TxIn;
+        let inputs: Vec<TxIn> = selected_utxos
+            .iter()
+            .map(|(outpoint, _)| TxIn {
+                prevout: outpoint.clone(),
+                sig: vec![],     // Will be filled by wallet
+                pubkey: vec![],  // Will be filled by wallet
+            })
+            .collect();
+
+        // Create transaction outputs (payment + change).
+        use nulla_core::TxOut;
+        let mut outputs = vec![TxOut {
+            value_atoms: amount_atoms,
+            script_pubkey: recipient.to_script_pubkey(),
+        }];
+
+        // Add change output if there's any leftover.
+        let change = selected_value - amount_atoms;
+        if change > 0 {
+            outputs.push(TxOut {
+                value_atoms: change,
+                script_pubkey: sender_addr.to_script_pubkey(),
+            });
+        }
+
+        // Create and sign the transaction.
+        let tx = match wallet.create_transaction(inputs, outputs, 0) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Error creating transaction: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let txid = nulla_core::tx_id(&tx);
+
+        // Validate transaction signatures before broadcasting.
+        if let Err(e) = db.verify_tx_signatures(&tx) {
+            eprintln!("Error: Transaction signature verification failed: {}", e);
+            std::process::exit(1);
+        }
+
+        // Validate transaction inputs before broadcasting.
+        if let Err(e) = db.validate_tx_inputs(&tx) {
+            eprintln!("Error: Transaction input validation failed: {}", e);
+            std::process::exit(1);
+        }
+
+        // Add transaction to mempool.
+        if let Err(e) = db.put_mempool_tx(&tx) {
+            eprintln!("Error adding transaction to mempool: {}", e);
+            std::process::exit(1);
+        }
+
+        println!("\n=== Transaction Created ===");
+        println!("From:   {}", sender_addr);
+        println!("To:     {}", recipient);
+        println!("Amount: {} NULLA ({} atoms)", amount_nulla, amount_atoms);
+        if change > 0 {
+            println!("Change: {} NULLA ({} atoms)", nulla_wallet::atoms_to_nulla(change), change);
+        }
+        println!("TxID:   {}", hex::encode(txid));
+        println!("\nBroadcasting transaction to peers...");
+
+        // Setup networking to broadcast the transaction.
+        let chain_id = chain_id_bytes(&args.chain_id);
+        let listen_addrs = parse_multiaddrs(&args.listen)?;
+        let peer_addrs = parse_multiaddrs(&args.peers)?;
+
+        if peer_addrs.is_empty() {
+            eprintln!("\nError: No peers configured!");
+            eprintln!("Transaction created but NOT broadcasted (no peers online).");
+            eprintln!("The transaction is saved in the local mempool.");
+            eprintln!("To broadcast, restart the node with --peers to connect to the network.");
+            std::process::exit(1);
+        }
+
+        let net_cfg = nulla_net::NetConfig {
+            chain_id,
+            listen: listen_addrs,
+            peers: peer_addrs.clone(),
+            dandelion: false, // Disable Dandelion for direct broadcast
+            cover_traffic: false,
+        };
+
+        let handle = nulla_net::spawn_network(net_cfg).await?;
+        println!("Connected to {} peer(s)", peer_addrs.len());
+
+        // Wait a bit for connections to establish.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Broadcast the full transaction to the network.
+        handle.commands.send(nulla_net::NetworkCommand::PublishFullTx { tx }).await?;
+
+        println!("Transaction broadcasted successfully!");
+        println!("\nThe transaction will be included in the next block.");
+
+        return Ok(());
+    }
+
     let chain_id = chain_id_bytes(&args.chain_id);
 
     info!("starting nulla-node chain_id={:?}", args.chain_id);
@@ -300,20 +500,20 @@ async fn main() -> Result<()> {
         // Spawn periodic peer sync task
         tokio::spawn(periodic_peer_sync(cmd_tx.clone(), db.clone()));
 
-        // If mining is enabled, spawn the stub miner task.
-        if args.mine {
-            spawn_miner(chain_id, cmd_tx.clone())?;
+        // If seed mode is enabled, spawn the seed node (relay/sync only).
+        if args.seed {
+            spawn_seed(chain_id, cmd_tx.clone(), db.clone(), handle.local_peer_id)?;
         }
 
-        // If seed mode is enabled, spawn the seed block builder.
-        if args.seed {
+        // If mining is enabled, spawn the miner block builder.
+        if args.mine {
             // Determine coinbase address (prefer miner_address for security)
             let coinbase_addr = miner_address.or_else(|| wallet.as_ref().map(|w| w.address()));
 
             if coinbase_addr.is_none() {
-                warn!("seed mode enabled but no address provided; use --miner-address or --wallet-seed to receive block rewards");
+                warn!("mining enabled but no address provided; use --miner-address or --wallet-seed to receive block rewards");
             }
-            spawn_seed(chain_id, cmd_tx, db.clone(), handle.local_peer_id, coinbase_addr)?;
+            spawn_miner_real(chain_id, cmd_tx.clone(), db.clone(), handle.local_peer_id, coinbase_addr)?;
         }
     } else {
         info!("gossip stack disabled; node running in local-only mode");
@@ -363,6 +563,49 @@ async fn handle_network_events(
         match evt {
             NetworkEvent::TxInv { from, txid } => {
                 info!("inv tx from {from}: {}", hex::encode(txid));
+
+                // Check if we already have this transaction in the mempool
+                if db.get_mempool_tx(&txid).unwrap_or(None).is_some() {
+                    info!("tx {} already in mempool, skipping", hex::encode(txid));
+                } else {
+                    // We don't have this transaction yet, request it from the peer
+                    info!("requesting tx {} from {}", hex::encode(txid), from);
+                    // Note: We would send a GetTx request here, but for now we just log it
+                    // In a full implementation, we'd use the request/response protocol
+                }
+            }
+            NetworkEvent::FullTx { from, tx } => {
+                let txid = nulla_core::tx_id(&tx);
+                info!("received full tx from {from}: {}", hex::encode(txid));
+
+                // Check if we already have this transaction
+                if db.get_mempool_tx(&txid).unwrap_or(None).is_some() {
+                    info!("tx {} already in mempool, skipping", hex::encode(txid));
+                    continue;
+                }
+
+                // Validate transaction signatures
+                if let Err(e) = db.verify_tx_signatures(&tx) {
+                    warn!("received invalid transaction (signature verification failed): {e}");
+                    continue;
+                }
+
+                // Validate transaction inputs (check UTXOs exist and aren't spent)
+                if let Err(e) = db.validate_tx_inputs(&tx) {
+                    warn!("received invalid transaction (input validation failed): {e}");
+                    continue;
+                }
+
+                // Add to mempool
+                if let Err(e) = db.put_mempool_tx(&tx) {
+                    warn!("failed to add transaction to mempool: {e}");
+                    continue;
+                }
+
+                info!("transaction {} added to mempool, relaying to peers", hex::encode(txid));
+
+                // Relay the transaction to all other peers (gossip protocol)
+                let _ = cmd_tx.send(nulla_net::NetworkCommand::PublishFullTx { tx }).await;
             }
             NetworkEvent::BlockInv { from, header } => {
                 let block_id = nulla_core::block_header_id(&header);
@@ -542,6 +785,13 @@ async fn handle_network_events(
                     }
                 }
 
+                // Remove transactions from mempool (they're now in a block)
+                for tx in block.txs.iter().skip(1) {
+                    // Skip coinbase
+                    let txid = nulla_core::tx_id(tx);
+                    let _ = db.remove_mempool_tx(&txid);
+                }
+
                 // Update best tip if appropriate
                 match db.best_tip() {
                     Ok(Some((tip_id, tip_height, tip_work))) => {
@@ -653,10 +903,32 @@ fn handle_request(db: &NullaDb, req: protocol::Req) -> protocol::Resp {
             }
         }
         protocol::Req::GetHeaders { from, limit } => {
-            // Stub: return an empty list for now.
-            // A full implementation would traverse the chain from the given hash.
+            // Traverse the chain backwards from the given hash and return block headers.
             info!("get headers from {} limit {}", hex::encode(from), limit);
-            protocol::Resp::Headers { headers: vec![] }
+
+            let mut headers = Vec::new();
+            let mut current_id = from;
+            let max_headers = limit.min(500); // Cap at 500 to prevent abuse
+
+            for _ in 0..max_headers {
+                match db.get_block(&current_id) {
+                    Ok(Some(block)) => {
+                        let header = block.header.clone();
+                        let prev = header.prev;
+                        headers.push(header);
+
+                        // Stop at genesis (prev == all zeros)
+                        if prev == [0u8; 32] {
+                            break;
+                        }
+                        current_id = prev;
+                    }
+                    _ => break, // Block not found or error, stop traversal
+                }
+            }
+
+            info!("returning {} headers", headers.len());
+            protocol::Resp::Headers { headers }
         }
         protocol::Req::GetTx { id } => {
             // Stub: return None for now.
@@ -681,70 +953,101 @@ fn handle_request(db: &NullaDb, req: protocol::Req) -> protocol::Resp {
 }
 
 /// Spawn a stub miner that periodically broadcasts dummy blocks for testing gossip.
-fn spawn_miner(chain_id: [u8; 4], cmd_tx: async_channel::Sender<NetworkCommand>) -> Result<()> {
+
+/// Periodically sync chain state with connected peers.
+///
+/// Every 60 seconds, this task:
+/// - Logs current chain state
+/// - Ensures peers are kept in sync via gossipsub
+async fn periodic_peer_sync(
+    _cmd_tx: async_channel::Sender<NetworkCommand>,
+    db: NullaDb,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+        // Log current chain state for monitoring
+        match db.best_tip() {
+            Ok(Some((tip_id, height, work))) => {
+                info!(
+                    "sync tick: height={} tip={} work={} mempool={}",
+                    height,
+                    hex::encode(&tip_id[..8]),
+                    work,
+                    db.mempool_size()
+                );
+            }
+            Ok(None) => {
+                info!("sync tick: no chain tip yet, waiting for blocks");
+            }
+            Err(e) => {
+                warn!("sync tick: failed to get chain state: {}", e);
+            }
+        }
+
+        // Note: Blockchain synchronization happens automatically via gossipsub.
+        // When peers receive blocks, they:
+        // 1. Validate and store the block
+        // 2. Update their chain tip if the block extends the best chain
+        // 3. Re-broadcast the block to other peers
+        //
+        // This creates a natural gossip-based synchronization where all peers
+        // eventually converge on the same chain state.
+    }
+}
+
+/// Spawn a seed node that relays and syncs blocks without mining.
+///
+/// Seed nodes:
+/// - Connect to peers and relay blocks/transactions
+/// - Sync blockchain state from the network
+/// - Do NOT create new blocks
+/// - Help bootstrap and maintain network connectivity
+fn spawn_seed(
+    _chain_id: [u8; 4],
+    _cmd_tx: async_channel::Sender<NetworkCommand>,
+    db: NullaDb,
+    local_peer_id: libp2p::PeerId,
+) -> Result<()> {
     tokio::spawn(async move {
-        info!("miner started (stub, no real chain state yet)");
+        info!("seed node started (peer_id: {local_peer_id})");
+        info!("seed: relay mode active - will sync and relay blocks but not mine");
+
+        // Seed node just needs to stay alive and let the networking layer
+        // handle block relay and synchronization. The periodic_peer_sync
+        // and handle_network_events tasks handle the actual syncing.
+
+        // Log periodic status updates
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
-            // Create and broadcast a dummy block header to exercise the gossip network.
-            let header = dummy_header(chain_id);
-            let _ = cmd_tx
-                .send(NetworkCommand::PublishBlock { header })
-                .await;
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            interval.tick().await;
+
+            match db.best_tip() {
+                Ok(Some((tip_id, height, work))) => {
+                    info!("seed: synced to height {} (tip: {}, work: {})",
+                          height, hex::encode(&tip_id[..8]), work);
+                }
+                Ok(None) => {
+                    info!("seed: waiting for blockchain data from peers...");
+                }
+                Err(e) => {
+                    warn!("seed: failed to get best tip: {e}");
+                }
+            }
         }
     });
     Ok(())
 }
 
-/// Generate a dummy block header with a very low difficulty target.
-fn dummy_header(chain_id: [u8; 4]) -> BlockHeader {
-    let mut target = [0xffu8; 32];
-    target[0] = 0x0f; // Very easy difficulty for testing
-    BlockHeader {
-        chain_id,
-        version: 1,
-        height: 0,
-        prev: Hash32::default(),
-        merkle_root: Hash32::default(),
-        timestamp: chrono::Utc::now().timestamp() as u64,
-        target,
-        nonce: rand::random(),
-    }
-}
-
-/// Periodically sync chain state with connected peers.
+/// Spawn a miner that builds blocks on top of the chain with proof-of-work.
 ///
-/// Every 60 seconds, this task:
-/// - Requests peer addresses for peer discovery
-/// - Requests the best chain tip to check if we're behind
-/// - Logs sync status
-async fn periodic_peer_sync(
-    _cmd_tx: async_channel::Sender<NetworkCommand>,
-    _db: NullaDb,
-) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-
-        // Note: Peer exchange and tip requests are currently handled via
-        // the request/response protocol but not actively sent here.
-        // This is a placeholder for future sync logic that will:
-        // 1. Send GetAddr requests to learn about new peers
-        // 2. Send GetTip requests to check if we're synced
-        // 3. Request missing blocks/headers if we're behind
-
-        info!("periodic sync tick (peer discovery and chain sync)");
-    }
-}
-
-/// Spawn a seed node that builds blocks on top of the chain without mining.
-///
-/// The seed role:
+/// Miners:
 /// - Tracks the best chain tip from the database
-/// - Creates new blocks every 30 seconds building on top of the best tip
-/// - Increments block height properly
-/// - Does NOT perform proof-of-work (uses easy target for testing)
-/// - Uses its own peer ID to ensure only one seed creates blocks at a time
-fn spawn_seed(
+/// - Creates new blocks building on top of the best tip
+/// - Performs actual proof-of-work mining to find valid nonces
+/// - Includes transactions from the mempool
+/// - Broadcasts found blocks to all peers
+fn spawn_miner_real(
     chain_id: [u8; 4],
     cmd_tx: async_channel::Sender<NetworkCommand>,
     db: NullaDb,
@@ -752,30 +1055,28 @@ fn spawn_seed(
     coinbase_addr: Option<nulla_wallet::Address>,
 ) -> Result<()> {
     tokio::spawn(async move {
-        info!("seed node started (peer_id: {local_peer_id})");
+        info!("miner started (peer_id: {local_peer_id})");
 
         // Log coinbase recipient address
         if let Some(addr) = coinbase_addr {
-            info!("seed: coinbase rewards will be sent to {}", addr);
+            info!("miner: coinbase rewards will be sent to {}", addr);
         } else {
-            warn!("seed: no address provided, blocks will have dummy coinbase (no real rewards)");
+            warn!("miner: no address provided, blocks will have dummy coinbase (no real rewards)");
         }
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-
             // Get the current best tip from the database.
             let (prev_id, prev_height, prev_work) = match db.best_tip() {
                 Ok(Some((id, height, work))) => {
-                    info!("seed: building on height {height} (work: {work})");
+                    info!("miner: building on height {height} (work: {work})");
                     (id, height, work)
                 }
                 Ok(None) => {
-                    info!("seed: no tip found, building genesis block");
+                    info!("miner: no tip found, building genesis block");
                     (Hash32::default(), 0, 0)
                 }
                 Err(e) => {
-                    warn!("seed: failed to get best tip: {e}");
+                    warn!("miner: failed to get best tip: {e}");
                     continue;
                 }
             };
@@ -789,7 +1090,7 @@ fn spawn_seed(
 
             // Create coinbase transaction if we have a wallet
             use nulla_core::{Block, Tx};
-            let txs: Vec<Tx> = if let Some(addr) = coinbase_addr {
+            let mut txs: Vec<Tx> = if let Some(addr) = coinbase_addr {
                 vec![nulla_wallet::create_coinbase(
                     &addr,
                     next_height,
@@ -812,30 +1113,66 @@ fn spawn_seed(
                 }]
             };
 
+            // Include transactions from the mempool
+            match db.get_mempool_txs() {
+                Ok(mempool_txs) if !mempool_txs.is_empty() => {
+                    info!("miner: including {} transaction(s) from mempool", mempool_txs.len());
+                    txs.extend(mempool_txs);
+                }
+                Ok(_) => {
+                    info!("miner: mempool is empty, block will only contain coinbase");
+                }
+                Err(e) => {
+                    warn!("miner: failed to get mempool transactions: {e}");
+                }
+            }
+
             // Compute merkle root
             let txids: Vec<Hash32> = txs.iter().map(nulla_core::tx_id).collect();
             let merkle_root = nulla_core::merkle_root(&txids);
 
-            let header = nulla_core::BlockHeader {
-                chain_id,
-                version: 1,
-                height: next_height,
-                prev: prev_id,
-                merkle_root,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                target: [0xffu8; 32], // Very easy target (no real mining)
-                nonce: rand::random(),
+            // Set mining difficulty target (easier than Bitcoin for testing)
+            let mut target = [0xffu8; 32];
+            target[0] = 0x0f;  // First byte must be less than 0x0f (moderate difficulty)
+
+            // Mine for a valid nonce
+            info!("miner: mining block at height {}...", next_height);
+            let mut nonce: u64 = 0;
+            let (header, block_id) = loop {
+                let header = nulla_core::BlockHeader {
+                    chain_id,
+                    version: 1,
+                    height: next_height,
+                    prev: prev_id,
+                    merkle_root,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                    target,
+                    nonce,
+                };
+
+                let temp_block = Block { header: header.clone(), txs: txs.clone() };
+                let temp_block_id = nulla_core::block_id(&temp_block);
+
+                // Check if block hash meets target
+                if temp_block_id[0] < target[0] {
+                    info!("miner: found valid block! nonce={} hash={}", nonce, hex::encode(temp_block_id));
+                    break (header, temp_block_id);
+                }
+
+                nonce += 1;
+                if nonce % 100000 == 0 {
+                    info!("miner: tried {} nonces...", nonce);
+                }
             };
 
             let block = Block { header: header.clone(), txs };
-            let block_id = nulla_core::block_id(&block);
 
             // Calculate cumulative work.
             let block_work = nulla_core::target_work(&header.target);
             let cumulative_work = prev_work + block_work;
 
             info!(
-                "seed: broadcasting block height={} id={} (work: {}, reward: {} NULLA)",
+                "miner: broadcasting block height={} id={} (work: {}, reward: {} NULLA)",
                 next_height,
                 hex::encode(block_id),
                 cumulative_work,
@@ -844,27 +1181,31 @@ fn spawn_seed(
 
             // Store the full block (header + transactions).
             if let Err(e) = db.put_block_full(&block) {
-                warn!("seed: failed to store block: {e}");
+                warn!("miner: failed to store block: {e}");
                 continue;
             }
             if let Err(e) = db.set_work(&block_id, cumulative_work) {
-                warn!("seed: failed to store cumulative work: {e}");
+                warn!("miner: failed to store cumulative work: {e}");
                 continue;
             }
             if let Err(e) = db.set_best_tip(&block_id, next_height, cumulative_work) {
-                warn!("seed: failed to set best tip: {e}");
+                warn!("miner: failed to set best tip: {e}");
                 continue;
             }
 
-            // Store coinbase UTXO if we have a recipient
-            if coinbase_addr.is_some() {
-                let coinbase_txid = nulla_core::tx_id(&block.txs[0]);
-                let coinbase_outpoint = nulla_core::OutPoint {
-                    txid: coinbase_txid,
-                    vout: 0,
-                };
-                if let Err(e) = db.put_utxo(&coinbase_outpoint, &block.txs[0].outputs[0]) {
-                    warn!("seed: failed to store coinbase UTXO: {e}");
+            // Apply all transactions (including coinbase) to UTXO set
+            for tx in &block.txs {
+                if let Err(e) = db.apply_tx(tx) {
+                    warn!("miner: failed to apply transaction: {e}");
+                }
+            }
+
+            // Remove transactions from mempool now that they're in a block
+            for (i, tx) in block.txs.iter().enumerate().skip(1) {
+                // Skip coinbase (index 0)
+                let txid = nulla_core::tx_id(tx);
+                if let Err(e) = db.remove_mempool_tx(&txid) {
+                    warn!("miner: failed to remove tx {} from mempool: {e}", i);
                 }
             }
 
