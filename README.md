@@ -110,7 +110,13 @@ The stub miner broadcasts independent dummy blocks every 30 seconds. Unlike `--s
 
 ### Wallet Operations
 
-Generate a new wallet:
+#### Token Economics
+
+- **1 NULLA** = 100,000,000 atoms (8 decimal places, like Bitcoin satoshis)
+- **Block Reward**: 8 NULLA (800,000,000 atoms) per block
+
+#### Generate a New Wallet
+
 ```bash
 cargo run -p nulla-node -- --generate-wallet
 ```
@@ -122,7 +128,41 @@ Address: 79bc6374ccc99f1211770ce007e05f6235b98c8b
 Seed:    a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094
 ```
 
-**Save your seed securely!** You can restore your wallet using:
+**Save your seed securely!** You can restore your wallet using `--wallet-seed`.
+
+#### Check Wallet Address
+
+Display the address for a given wallet seed:
+```bash
+cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --get-address
+```
+
+Output:
+```
+=== Wallet Address ===
+79bc6374ccc99f1211770ce007e05f6235b98c8b
+```
+
+#### Check Wallet Balance
+
+Display the balance and UTXOs for a wallet:
+```bash
+cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --get-balance --db ./data
+```
+
+Output:
+```
+=== Wallet Balance ===
+Address: 79bc6374ccc99f1211770ce007e05f6235b98c8b
+Balance: 0.00000000 NULLA (0 atoms)
+UTXOs:   0
+
+Note: Full UTXO scanning not yet implemented.
+```
+
+#### Using a Wallet with a Running Node
+
+Load a wallet when starting the node:
 ```bash
 cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --listen /ip4/0.0.0.0/tcp/27444
 ```
@@ -198,6 +238,8 @@ sudo ufw reload
 
 - `--generate-wallet`: Generate a new wallet and print address and seed
 - `--wallet-seed <HEX>`: Load wallet from 32-byte hex seed
+- `--get-address`: Display wallet address (requires `--wallet-seed`)
+- `--get-balance`: Display wallet balance and UTXOs (requires `--wallet-seed` and `--db`)
 
 ### Placeholders (Not Yet Implemented)
 
@@ -230,12 +272,15 @@ sudo ufw reload
 - [x] CLI commands for wallet generation and restoration
 
 ### In Progress 🚧
-- [ ] Chain selection based on cumulative work
+- [x] Chain selection based on cumulative work
+- [x] Token economics (100M atoms per NULLA, 8 NULLA block reward)
+- [x] Wallet balance and address commands
+- [ ] Coinbase transactions (block rewards)
 - [ ] Fork resolution and reorganization
 - [ ] Active block fetching when behind
 - [ ] Full script execution and signature verification
 - [ ] Difficulty adjustment algorithm
-- [ ] Economic model (block rewards, transaction fees)
+- [ ] UTXO indexing by address for balance calculation
 
 ### Planned 📋
 
