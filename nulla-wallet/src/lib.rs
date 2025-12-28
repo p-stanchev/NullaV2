@@ -7,10 +7,26 @@
 //! - UTXO management for wallet balances
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use nulla_core::{Tx, TxIn, TxOut};
+use nulla_core::{OutPoint, Tx, TxIn, TxOut};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Number of atoms per NULLA.
+pub const ATOMS_PER_NULLA: u64 = 100_000_000;
+
+/// Block reward in atoms (8 NULLA = 800,000,000 atoms).
+pub const BLOCK_REWARD_ATOMS: u64 = 8 * ATOMS_PER_NULLA;
+
+/// Convert atoms to NULLA with 8 decimal places.
+pub fn atoms_to_nulla(atoms: u64) -> f64 {
+    atoms as f64 / ATOMS_PER_NULLA as f64
+}
+
+/// Convert NULLA to atoms.
+pub fn nulla_to_atoms(nulla: f64) -> u64 {
+    (nulla * ATOMS_PER_NULLA as f64) as u64
+}
 
 /// Wallet errors.
 #[derive(Debug, Error)]
@@ -201,6 +217,20 @@ impl Default for Wallet {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// UTXO (Unspent Transaction Output) for wallet balance tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletUtxo {
+    /// The outpoint (txid + vout) that can be spent.
+    pub outpoint: OutPoint,
+    /// The output containing value and script.
+    pub output: TxOut,
+}
+
+/// Calculate total balance from a list of UTXOs.
+pub fn calculate_balance(utxos: &[WalletUtxo]) -> u64 {
+    utxos.iter().map(|u| u.output.value_atoms).sum()
 }
 
 #[cfg(test)]

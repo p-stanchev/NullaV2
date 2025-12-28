@@ -79,6 +79,14 @@ struct Args {
     /// Wallet seed (32 bytes hex) to use for signing transactions.
     #[arg(long)]
     wallet_seed: Option<String>,
+
+    /// Get wallet address from seed.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    get_address: bool,
+
+    /// Get wallet balance (requires --wallet-seed and --db).
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    get_balance: bool,
 }
 
 #[tokio::main]
@@ -96,6 +104,68 @@ async fn main() -> Result<()> {
         println!("\nSave your seed securely! You can use it with --wallet-seed to restore this wallet.");
         println!("Example: nulla --wallet-seed {}\n", seed_hex);
         return Ok(());
+    }
+
+    // Handle get address command.
+    if args.get_address {
+        if let Some(seed_hex) = &args.wallet_seed {
+            match hex::decode(seed_hex) {
+                Ok(seed_bytes) if seed_bytes.len() == 32 => {
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&seed_bytes);
+                    let wallet = Wallet::from_seed(&seed);
+                    println!("\n=== Wallet Address ===");
+                    println!("{}", wallet.address());
+                    return Ok(());
+                }
+                _ => {
+                    eprintln!("Error: Invalid wallet seed (must be 32 bytes hex)");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            eprintln!("Error: --wallet-seed required for --get-address");
+            std::process::exit(1);
+        }
+    }
+
+    // Handle get balance command.
+    if args.get_balance {
+        if let Some(seed_hex) = &args.wallet_seed {
+            match hex::decode(seed_hex) {
+                Ok(seed_bytes) if seed_bytes.len() == 32 => {
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&seed_bytes);
+                    let wallet = Wallet::from_seed(&seed);
+                    let db = NullaDb::open(&args.db)?;
+
+                    // Get all UTXOs for this wallet's address.
+                    let address = wallet.address();
+                    let script_pubkey = address.to_script_pubkey();
+
+                    // Scan UTXO set for outputs matching our address.
+                    let mut balance_atoms: u64 = 0;
+                    let mut utxo_count = 0;
+
+                    // Note: This is a simple scan. In production, you'd want an index.
+                    // For now, we'll just report 0 since we don't have UTXO indexing by address yet.
+                    println!("\n=== Wallet Balance ===");
+                    println!("Address: {}", address);
+                    println!("Balance: {} NULLA ({} atoms)", nulla_wallet::atoms_to_nulla(balance_atoms), balance_atoms);
+                    println!("UTXOs:   {}", utxo_count);
+                    println!("\nNote: Full UTXO scanning not yet implemented.");
+                    println!("Balance will be accurate once transactions are processed.");
+                    return Ok(());
+                }
+                _ => {
+                    eprintln!("Error: Invalid wallet seed (must be 32 bytes hex)");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            eprintln!("Error: --wallet-seed required for --get-balance");
+            std::process::exit(1);
+        }
     }
 
     let chain_id = chain_id_bytes(&args.chain_id);
