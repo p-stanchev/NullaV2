@@ -17,6 +17,9 @@ pub const META_BEST_TIP: &str = "best_tip";
 /// Key for storing the best block height.
 pub const META_BEST_HEIGHT: &str = "best_height";
 
+/// Key for storing the cumulative work of the best chain.
+pub const META_BEST_WORK: &str = "best_work";
+
 /// Database errors.
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -49,6 +52,8 @@ pub struct NullaDb {
     mempool: Tree,
     /// Spent outputs indexed by OutPoint.
     spent: Tree,
+    /// Cumulative work for each block header (indexed by block ID).
+    work: Tree,
 }
 
 impl NullaDb {
@@ -63,19 +68,21 @@ impl NullaDb {
             utxos: db.open_tree("utxos")?,
             mempool: db.open_tree("mempool")?,
             spent: db.open_tree("spent")?,
+            work: db.open_tree("work")?,
             _db: db,
         })
     }
 
     /// Update the best tip (highest cumulative work chain).
-    pub fn set_best_tip(&self, id: &Hash32, height: u64) -> Result<()> {
+    pub fn set_best_tip(&self, id: &Hash32, height: u64, cumulative_work: u128) -> Result<()> {
         self.meta.insert(META_BEST_TIP, id)?;
         self.meta.insert(META_BEST_HEIGHT, &height.to_be_bytes())?;
+        self.meta.insert(META_BEST_WORK, &cumulative_work.to_be_bytes())?;
         Ok(())
     }
 
-    /// Retrieve the current best tip hash and height.
-    pub fn best_tip(&self) -> Result<Option<(Hash32, u64)>> {
+    /// Retrieve the current best tip hash, height, and cumulative work.
+    pub fn best_tip(&self) -> Result<Option<(Hash32, u64, u128)>> {
         let tip = match self.meta.get(META_BEST_TIP)? {
             Some(val) => {
                 let mut h = [0u8; 32];
@@ -89,7 +96,29 @@ impl NullaDb {
             .get(META_BEST_HEIGHT)?
             .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8; 8])))
             .unwrap_or(0);
-        Ok(Some((tip, height)))
+        let work = self
+            .meta
+            .get(META_BEST_WORK)?
+            .map(|v| u128::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8; 16])))
+            .unwrap_or(0);
+        Ok(Some((tip, height, work)))
+    }
+
+    /// Get the cumulative work for a specific block.
+    pub fn get_work(&self, id: &Hash32) -> Result<Option<u128>> {
+        match self.work.get(id)? {
+            Some(bytes) => {
+                let arr: [u8; 16] = bytes.as_ref().try_into().unwrap_or([0u8; 16]);
+                Ok(Some(u128::from_be_bytes(arr)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Set the cumulative work for a block.
+    pub fn set_work(&self, id: &Hash32, work: u128) -> Result<()> {
+        self.work.insert(id, &work.to_be_bytes())?;
+        Ok(())
     }
 
     /// Store a block header in the database.

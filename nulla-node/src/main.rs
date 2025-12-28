@@ -226,15 +226,33 @@ async fn handle_network_events(
                     continue;
                 }
 
+                // Calculate cumulative work for this block.
+                let block_work = nulla_core::target_work(&header.target);
+                let cumulative_work = if header.prev == [0u8; 32] {
+                    // Genesis block
+                    block_work
+                } else {
+                    // Add this block's work to the previous block's cumulative work
+                    match db.get_work(&header.prev) {
+                        Ok(Some(prev_work)) => prev_work + block_work,
+                        _ => block_work, // If we don't have the previous block, start fresh
+                    }
+                };
+
+                // Store the cumulative work for this block.
+                if let Err(e) = db.set_work(&block_id, cumulative_work) {
+                    warn!("failed to store cumulative work: {e}");
+                }
+
                 // Check if this block is on top of our current best tip.
                 match db.best_tip() {
-                    Ok(Some((tip_id, tip_height))) => {
+                    Ok(Some((tip_id, tip_height, tip_work))) => {
                         // If this block builds on our tip, update the tip.
                         if header.prev == tip_id && header.height == tip_height + 1 {
-                            if let Err(e) = db.set_best_tip(&block_id, header.height) {
+                            if let Err(e) = db.set_best_tip(&block_id, header.height, cumulative_work) {
                                 warn!("failed to update best tip: {e}");
                             } else {
-                                info!("updated best tip to height {}", header.height);
+                                info!("updated best tip to height {} (work: {})", header.height, cumulative_work);
 
                                 // Update progress bar if syncing.
                                 let mut progress_lock = sync_progress.lock().await;
@@ -245,6 +263,19 @@ async fn handle_network_events(
                                         *progress_lock = None;
                                     }
                                 }
+                            }
+                        } else if cumulative_work > tip_work {
+                            // This chain has more work than our current tip (possible fork/reorg).
+                            info!(
+                                "received chain with more work (our: {}, theirs: {}), height: {}",
+                                tip_work, cumulative_work, header.height
+                            );
+
+                            // Update to the chain with most work.
+                            if let Err(e) = db.set_best_tip(&block_id, header.height, cumulative_work) {
+                                warn!("failed to update best tip: {e}");
+                            } else {
+                                info!("switched to new best chain at height {}", header.height);
                             }
                         } else if header.height > tip_height {
                             // We're behind, need to sync.
@@ -276,10 +307,10 @@ async fn handle_network_events(
                     Ok(None) => {
                         // No tip yet, this is our genesis.
                         if header.height == 0 {
-                            if let Err(e) = db.set_best_tip(&block_id, 0) {
+                            if let Err(e) = db.set_best_tip(&block_id, 0, cumulative_work) {
                                 warn!("failed to set genesis tip: {e}");
                             } else {
-                                info!("set genesis block as tip");
+                                info!("set genesis block as tip (work: {})", cumulative_work);
                             }
                         }
                     }
@@ -312,12 +343,11 @@ fn handle_request(db: &NullaDb, req: protocol::Req) -> protocol::Resp {
         protocol::Req::GetTip => {
             // Return the best known tip.
             match db.best_tip() {
-                Ok(Some((id, height))) => {
-                    // For now, cumulative work is a stub (just use height).
+                Ok(Some((id, height, cumulative_work))) => {
                     protocol::Resp::Tip {
                         height,
                         id,
-                        cumulative_work: height as u128,
+                        cumulative_work,
                     }
                 }
                 _ => protocol::Resp::Err { code: 404 },
@@ -434,14 +464,14 @@ fn spawn_seed(
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
             // Get the current best tip from the database.
-            let (prev_id, prev_height) = match db.best_tip() {
-                Ok(Some((id, height))) => {
-                    info!("seed: building on height {height}");
-                    (id, height)
+            let (prev_id, prev_height, prev_work) = match db.best_tip() {
+                Ok(Some((id, height, work))) => {
+                    info!("seed: building on height {height} (work: {work})");
+                    (id, height, work)
                 }
                 Ok(None) => {
                     info!("seed: no tip found, building genesis block");
-                    (Hash32::default(), 0)
+                    (Hash32::default(), 0, 0)
                 }
                 Err(e) => {
                     warn!("seed: failed to get best tip: {e}");
@@ -468,18 +498,28 @@ fn spawn_seed(
             };
 
             let block_id = nulla_core::block_header_id(&header);
+
+            // Calculate cumulative work.
+            let block_work = nulla_core::target_work(&header.target);
+            let cumulative_work = prev_work + block_work;
+
             info!(
-                "seed: broadcasting block height={} id={}",
+                "seed: broadcasting block height={} id={} (work: {})",
                 next_height,
-                hex::encode(block_id)
+                hex::encode(block_id),
+                cumulative_work
             );
 
-            // Store the header in the database and update the best tip.
+            // Store the header, cumulative work, and update the best tip.
             if let Err(e) = db.put_header(&header) {
                 warn!("seed: failed to store header: {e}");
                 continue;
             }
-            if let Err(e) = db.set_best_tip(&block_id, next_height) {
+            if let Err(e) = db.set_work(&block_id, cumulative_work) {
+                warn!("seed: failed to store cumulative work: {e}");
+                continue;
+            }
+            if let Err(e) = db.set_best_tip(&block_id, next_height, cumulative_work) {
                 warn!("seed: failed to set best tip: {e}");
                 continue;
             }
