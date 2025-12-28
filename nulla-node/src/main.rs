@@ -137,15 +137,15 @@ async fn main() -> Result<()> {
                     let mut seed = [0u8; 32];
                     seed.copy_from_slice(&seed_bytes);
                     let wallet = Wallet::from_seed(&seed);
-                    let db = NullaDb::open(&args.db)?;
+                    let _db = NullaDb::open(&args.db)?;
 
                     // Get all UTXOs for this wallet's address.
                     let address = wallet.address();
-                    let script_pubkey = address.to_script_pubkey();
+                    let _script_pubkey = address.to_script_pubkey();
 
                     // Scan UTXO set for outputs matching our address.
-                    let mut balance_atoms: u64 = 0;
-                    let mut utxo_count = 0;
+                    let balance_atoms: u64 = 0;
+                    let utxo_count = 0;
 
                     // Note: This is a simple scan. In production, you'd want an index.
                     // For now, we'll just report 0 since we don't have UTXO indexing by address yet.
@@ -173,19 +173,23 @@ async fn main() -> Result<()> {
     info!("starting nulla-node chain_id={:?}", args.chain_id);
 
     // Load wallet if seed is provided.
-    if let Some(seed_hex) = &args.wallet_seed {
+    let wallet = if let Some(seed_hex) = &args.wallet_seed {
         match hex::decode(seed_hex) {
             Ok(seed_bytes) if seed_bytes.len() == 32 => {
                 let mut seed = [0u8; 32];
                 seed.copy_from_slice(&seed_bytes);
                 let wallet = Wallet::from_seed(&seed);
                 info!("wallet loaded, address: {}", wallet.address());
+                Some(wallet)
             }
             _ => {
                 warn!("invalid wallet seed (must be 32 bytes hex), ignoring");
+                None
             }
         }
-    }
+    } else {
+        None
+    };
 
     // Open the database for blocks, headers, UTXOs, and mempool.
     let db = NullaDb::open(&args.db)?;
@@ -231,7 +235,10 @@ async fn main() -> Result<()> {
 
         // If seed mode is enabled, spawn the seed block builder.
         if args.seed {
-            spawn_seed(chain_id, cmd_tx, db.clone(), handle.local_peer_id)?;
+            if wallet.is_none() {
+                warn!("seed mode enabled but no wallet provided; use --wallet-seed to receive block rewards");
+            }
+            spawn_seed(chain_id, cmd_tx, db.clone(), handle.local_peer_id, wallet.clone())?;
         }
     } else {
         info!("gossip stack disabled; node running in local-only mode");
@@ -527,9 +534,24 @@ fn spawn_seed(
     cmd_tx: async_channel::Sender<NetworkCommand>,
     db: NullaDb,
     local_peer_id: libp2p::PeerId,
+    wallet: Option<Wallet>,
 ) -> Result<()> {
     tokio::spawn(async move {
         info!("seed node started (peer_id: {local_peer_id})");
+
+        // Get coinbase recipient address
+        let coinbase_addr = match &wallet {
+            Some(w) => {
+                let addr = w.address();
+                info!("seed: coinbase rewards will be sent to {}", addr);
+                Some(addr)
+            }
+            None => {
+                warn!("seed: no wallet, blocks will have no coinbase rewards");
+                None
+            }
+        };
+
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
@@ -556,33 +578,63 @@ fn spawn_seed(
                 prev_height + 1
             };
 
-            let header = BlockHeader {
+            // Create coinbase transaction if we have a wallet
+            use nulla_core::{Block, Tx};
+            let txs: Vec<Tx> = if let Some(addr) = coinbase_addr {
+                vec![nulla_wallet::create_coinbase(
+                    &addr,
+                    next_height,
+                    nulla_wallet::BLOCK_REWARD_ATOMS,
+                )]
+            } else {
+                // Create a dummy coinbase with no outputs (for testing without wallet)
+                vec![Tx {
+                    version: 1,
+                    inputs: vec![nulla_core::TxIn {
+                        prevout: nulla_core::OutPoint::null(),
+                        sig: next_height.to_le_bytes().to_vec(),
+                    }],
+                    outputs: vec![nulla_core::TxOut {
+                        value_atoms: nulla_wallet::BLOCK_REWARD_ATOMS,
+                        script_pubkey: vec![0x00; 25], // Dummy script
+                    }],
+                    lock_time: 0,
+                }]
+            };
+
+            // Compute merkle root
+            let txids: Vec<Hash32> = txs.iter().map(nulla_core::tx_id).collect();
+            let merkle_root = nulla_core::merkle_root(&txids);
+
+            let header = nulla_core::BlockHeader {
                 chain_id,
                 version: 1,
                 height: next_height,
                 prev: prev_id,
-                merkle_root: Hash32::default(),
+                merkle_root,
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 target: [0xffu8; 32], // Very easy target (no real mining)
                 nonce: rand::random(),
             };
 
-            let block_id = nulla_core::block_header_id(&header);
+            let block = Block { header: header.clone(), txs };
+            let block_id = nulla_core::block_id(&block);
 
             // Calculate cumulative work.
             let block_work = nulla_core::target_work(&header.target);
             let cumulative_work = prev_work + block_work;
 
             info!(
-                "seed: broadcasting block height={} id={} (work: {})",
+                "seed: broadcasting block height={} id={} (work: {}, reward: {} NULLA)",
                 next_height,
                 hex::encode(block_id),
-                cumulative_work
+                cumulative_work,
+                nulla_wallet::atoms_to_nulla(nulla_wallet::BLOCK_REWARD_ATOMS)
             );
 
-            // Store the header, cumulative work, and update the best tip.
-            if let Err(e) = db.put_header(&header) {
-                warn!("seed: failed to store header: {e}");
+            // Store the full block (header + transactions).
+            if let Err(e) = db.put_block_full(&block) {
+                warn!("seed: failed to store block: {e}");
                 continue;
             }
             if let Err(e) = db.set_work(&block_id, cumulative_work) {
@@ -592,6 +644,18 @@ fn spawn_seed(
             if let Err(e) = db.set_best_tip(&block_id, next_height, cumulative_work) {
                 warn!("seed: failed to set best tip: {e}");
                 continue;
+            }
+
+            // Store coinbase UTXO if we have a recipient
+            if coinbase_addr.is_some() {
+                let coinbase_txid = nulla_core::tx_id(&block.txs[0]);
+                let coinbase_outpoint = nulla_core::OutPoint {
+                    txid: coinbase_txid,
+                    vout: 0,
+                };
+                if let Err(e) = db.put_utxo(&coinbase_outpoint, &block.txs[0].outputs[0]) {
+                    warn!("seed: failed to store coinbase UTXO: {e}");
+                }
             }
 
             // Broadcast the block to the network.

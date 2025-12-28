@@ -151,6 +151,7 @@ impl std::fmt::Display for Address {
 }
 
 /// Simple wallet for managing keys and creating transactions.
+#[derive(Clone)]
 pub struct Wallet {
     /// The wallet's keypair.
     keypair: Keypair,
@@ -231,6 +232,31 @@ pub struct WalletUtxo {
 /// Calculate total balance from a list of UTXOs.
 pub fn calculate_balance(utxos: &[WalletUtxo]) -> u64 {
     utxos.iter().map(|u| u.output.value_atoms).sum()
+}
+
+/// Create a coinbase transaction (block reward) to a specific address.
+///
+/// The coinbase transaction has:
+/// - One null input (txid all zeros, vout 0xFFFFFFFF)
+/// - One output paying the block reward to the recipient address
+/// - Block height encoded in the signature field for uniqueness
+pub fn create_coinbase(recipient: &Address, block_height: u64, reward_atoms: u64) -> Tx {
+    Tx {
+        version: 1,
+        inputs: vec![TxIn {
+            prevout: OutPoint {
+                txid: [0u8; 32],
+                vout: 0xFFFF_FFFF,
+            },
+            // Encode block height in the signature field for uniqueness (like Bitcoin's coinbase script)
+            sig: block_height.to_le_bytes().to_vec(),
+        }],
+        outputs: vec![TxOut {
+            value_atoms: reward_atoms,
+            script_pubkey: recipient.to_script_pubkey(),
+        }],
+        lock_time: 0,
+    }
 }
 
 #[cfg(test)]

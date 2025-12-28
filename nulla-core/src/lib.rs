@@ -24,6 +24,21 @@ pub struct OutPoint {
     pub vout: u32,
 }
 
+impl OutPoint {
+    /// Create a null outpoint for coinbase transactions (all zeros).
+    pub fn null() -> Self {
+        Self {
+            txid: [0u8; 32],
+            vout: 0xFFFF_FFFF,
+        }
+    }
+
+    /// Check if this is a null outpoint (coinbase).
+    pub fn is_null(&self) -> bool {
+        self.txid == [0u8; 32] && self.vout == 0xFFFF_FFFF
+    }
+}
+
 /// A transaction input spending a previous output.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TxIn {
@@ -108,6 +123,11 @@ pub enum ValidationError {
     ValueOverflow,
 }
 
+/// Check if a transaction is a coinbase transaction (first tx in block with null input).
+pub fn is_coinbase(tx: &Tx) -> bool {
+    tx.inputs.len() == 1 && tx.inputs[0].prevout.is_null()
+}
+
 /// Compute the transaction ID by hashing the serialized transaction with BLAKE3.
 pub fn tx_id(tx: &Tx) -> Hash32 {
     let mut hasher = blake3::Hasher::new();
@@ -182,6 +202,7 @@ pub fn target_work(target: &Hash32) -> u128 {
 /// - Transaction has at least one input and one output
 /// - No duplicate inputs
 /// - Output values don't overflow
+/// - Coinbase transactions must have exactly one null input
 pub fn validate_tx_structure(tx: &Tx) -> Result<(), ValidationError> {
     if tx.inputs.is_empty() {
         return Err(ValidationError::EmptyInputs);
@@ -209,8 +230,36 @@ pub fn validate_tx_structure(tx: &Tx) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Validate a coinbase transaction (first tx in block).
+///
+/// Checks:
+/// - Exactly one input with a null outpoint
+/// - At least one output
+/// - Output values don't overflow
+pub fn validate_coinbase(tx: &Tx) -> Result<(), ValidationError> {
+    if tx.inputs.len() != 1 {
+        return Err(ValidationError::EmptyInputs);
+    }
+    if !tx.inputs[0].prevout.is_null() {
+        return Err(ValidationError::EmptyInputs);
+    }
+    if tx.outputs.is_empty() {
+        return Err(ValidationError::EmptyOutputs);
+    }
+
+    // Check that output values don't overflow
+    let mut total: u64 = 0;
+    for output in &tx.outputs {
+        total = total.checked_add(output.value_atoms)
+            .ok_or(ValidationError::ValueOverflow)?;
+    }
+
+    Ok(())
+}
+
 /// Validate a complete block, checking:
 /// - The block contains at least one transaction
+/// - The first transaction is a valid coinbase
 /// - The merkle root matches the computed root of all transaction IDs
 /// - The proof-of-work is valid
 /// - Basic transaction structure for all transactions
@@ -219,9 +268,18 @@ pub fn validate_block(block: &Block) -> Result<(), ValidationError> {
         return Err(ValidationError::EmptyBlock);
     }
 
-    // Validate all transaction structures
-    for tx in &block.txs {
+    // First transaction must be a coinbase
+    validate_coinbase(&block.txs[0])?;
+
+    // Remaining transactions must be regular (no coinbase inputs)
+    for tx in &block.txs[1..] {
         validate_tx_structure(tx)?;
+        // Ensure no coinbase inputs in regular transactions
+        for input in &tx.inputs {
+            if input.prevout.is_null() {
+                return Err(ValidationError::EmptyInputs);
+            }
+        }
     }
 
     let txids: Vec<Hash32> = block.txs.iter().map(tx_id).collect();
