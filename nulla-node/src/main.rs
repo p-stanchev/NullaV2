@@ -137,24 +137,32 @@ async fn main() -> Result<()> {
                     let mut seed = [0u8; 32];
                     seed.copy_from_slice(&seed_bytes);
                     let wallet = Wallet::from_seed(&seed);
-                    let _db = NullaDb::open(&args.db)?;
+                    let db = NullaDb::open(&args.db)?;
 
                     // Get all UTXOs for this wallet's address.
                     let address = wallet.address();
-                    let _script_pubkey = address.to_script_pubkey();
 
-                    // Scan UTXO set for outputs matching our address.
-                    let balance_atoms: u64 = 0;
-                    let utxo_count = 0;
+                    // Fetch UTXOs from the address index
+                    let utxos = db.get_utxos_by_address(&address.0)?;
+                    let balance_atoms: u64 = utxos.iter().map(|(_, txout)| txout.value_atoms).sum();
+                    let utxo_count = utxos.len();
 
-                    // Note: This is a simple scan. In production, you'd want an index.
-                    // For now, we'll just report 0 since we don't have UTXO indexing by address yet.
                     println!("\n=== Wallet Balance ===");
                     println!("Address: {}", address);
                     println!("Balance: {} NULLA ({} atoms)", nulla_wallet::atoms_to_nulla(balance_atoms), balance_atoms);
                     println!("UTXOs:   {}", utxo_count);
-                    println!("\nNote: Full UTXO scanning not yet implemented.");
-                    println!("Balance will be accurate once transactions are processed.");
+
+                    if !utxos.is_empty() {
+                        println!("\nUTXO Details:");
+                        for (outpoint, txout) in utxos {
+                            println!("  {} vout:{} = {} atoms",
+                                hex::encode(&outpoint.txid[..8]),
+                                outpoint.vout,
+                                txout.value_atoms
+                            );
+                        }
+                    }
+
                     return Ok(());
                 }
                 _ => {

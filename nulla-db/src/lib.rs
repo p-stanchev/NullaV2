@@ -11,6 +11,24 @@ use sled::{Config, Db, Tree};
 use std::path::Path;
 use thiserror::Error;
 
+/// Extract address bytes from a P2PKH-like script_pubkey.
+/// Returns Some([20-byte address]) if the script is valid P2PKH format.
+fn extract_address_bytes(script_pubkey: &[u8]) -> Option<Vec<u8>> {
+    if script_pubkey.len() != 25 {
+        return None;
+    }
+    if script_pubkey[0] == 0x76
+        && script_pubkey[1] == 0xa9
+        && script_pubkey[2] == 0x14
+        && script_pubkey[23] == 0x88
+        && script_pubkey[24] == 0xac
+    {
+        Some(script_pubkey[3..23].to_vec())
+    } else {
+        None
+    }
+}
+
 /// Key for storing the best (highest work) block tip hash.
 pub const META_BEST_TIP: &str = "best_tip";
 
@@ -54,6 +72,8 @@ pub struct NullaDb {
     spent: Tree,
     /// Cumulative work for each block header (indexed by block ID).
     work: Tree,
+    /// UTXO index by address (maps address bytes -> Vec<OutPoint>).
+    utxo_by_addr: Tree,
 }
 
 impl NullaDb {
@@ -69,6 +89,7 @@ impl NullaDb {
             mempool: db.open_tree("mempool")?,
             spent: db.open_tree("spent")?,
             work: db.open_tree("work")?,
+            utxo_by_addr: db.open_tree("utxo_by_addr")?,
             _db: db,
         })
     }
@@ -166,12 +187,29 @@ impl NullaDb {
         Ok(())
     }
 
-    /// Add a UTXO to the set.
+    /// Add a UTXO to the set and index by address.
     pub fn put_utxo(&self, out: &OutPoint, txout: &TxOut) -> Result<()> {
         self.utxos.insert(
             bincode::serialize(out)?,
             bincode::serialize(txout)?,
         )?;
+
+        // Extract address from script_pubkey and index this UTXO
+        if let Some(addr_bytes) = extract_address_bytes(&txout.script_pubkey) {
+            // Get existing outpoints for this address
+            let mut outpoints: Vec<OutPoint> = match self.utxo_by_addr.get(&addr_bytes)? {
+                Some(bytes) => bincode::deserialize(&bytes).unwrap_or_default(),
+                None => Vec::new(),
+            };
+
+            // Add this outpoint if not already present
+            if !outpoints.contains(out) {
+                outpoints.push(out.clone());
+                self.utxo_by_addr
+                    .insert(&addr_bytes, bincode::serialize(&outpoints)?)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -195,8 +233,26 @@ impl NullaDb {
         Ok(self.spent.contains_key(bincode::serialize(out)?)?)
     }
 
-    /// Remove a UTXO from the set (used during chain reorganization).
+    /// Remove a UTXO from the set and address index (used during chain reorganization).
     pub fn remove_utxo(&self, out: &OutPoint) -> Result<()> {
+        // Get the UTXO before removing to extract the address
+        if let Some(txout) = self.get_utxo(out)? {
+            if let Some(addr_bytes) = extract_address_bytes(&txout.script_pubkey) {
+                // Remove from address index
+                if let Some(bytes) = self.utxo_by_addr.get(&addr_bytes)? {
+                    let mut outpoints: Vec<OutPoint> =
+                        bincode::deserialize(&bytes).unwrap_or_default();
+                    outpoints.retain(|o| o != out);
+                    if outpoints.is_empty() {
+                        self.utxo_by_addr.remove(&addr_bytes)?;
+                    } else {
+                        self.utxo_by_addr
+                            .insert(&addr_bytes, bincode::serialize(&outpoints)?)?;
+                    }
+                }
+            }
+        }
+
         self.utxos.remove(bincode::serialize(out)?)?;
         Ok(())
     }
@@ -345,5 +401,27 @@ impl NullaDb {
         }
 
         Ok(())
+    }
+
+    /// Get all UTXOs for a specific address.
+    ///
+    /// Returns a vector of (OutPoint, TxOut) tuples for all unspent outputs
+    /// belonging to the given address (20 bytes).
+    pub fn get_utxos_by_address(&self, address_bytes: &[u8; 20]) -> Result<Vec<(OutPoint, TxOut)>> {
+        let mut result = Vec::new();
+
+        // Look up outpoints for this address
+        if let Some(bytes) = self.utxo_by_addr.get(address_bytes)? {
+            let outpoints: Vec<OutPoint> = bincode::deserialize(&bytes)?;
+
+            // Fetch each UTXO
+            for outpoint in outpoints {
+                if let Some(txout) = self.get_utxo(&outpoint)? {
+                    result.push((outpoint, txout));
+                }
+            }
+        }
+
+        Ok(result)
     }
 }
