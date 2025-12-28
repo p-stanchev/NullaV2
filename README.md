@@ -157,7 +157,7 @@ Address: 79bc6374ccc99f1211770ce007e05f6235b98c8b
 Balance: 0.00000000 NULLA (0 atoms)
 UTXOs:   0
 
-Note: Full UTXO scanning not yet implemented.
+The balance will show coinbase rewards earned by running as a seed node.
 ```
 
 #### Using a Wallet with a Running Node
@@ -277,14 +277,19 @@ sudo ufw reload
 - [x] UTXO validation (inputs exist, not double-spent, value conservation)
 - [x] Transaction application to UTXO set (mark spent, create new UTXOs)
 - [x] Transaction revert support for chain reorganizations
+- [x] Full block gossip protocol (nodes sync complete blocks with transactions)
+- [x] Block processing with automatic UTXO set updates
+- [x] Ed25519 signature verification infrastructure
+- [x] UTXO indexing by address (O(1) balance lookups)
+- [x] Working wallet balance checker with UTXO details
 
 ### In Progress 🚧
-- [ ] Active block fetching when behind (gossip broadcasts headers only currently)
-- [ ] Full block gossip or request/response protocol for sync
+- [ ] Wire up signature verification when processing blocks
+- [ ] Wire up UTXO validation when accepting blocks
 - [ ] Fork resolution and reorganization (helpers exist, needs wiring)
-- [ ] Full script execution and signature verification
 - [ ] Difficulty adjustment algorithm
-- [ ] UTXO indexing by address for balance calculation
+- [ ] Full script execution
+- [ ] Transaction fees and fee validation
 
 ### Planned 📋
 
