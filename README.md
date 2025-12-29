@@ -527,9 +527,12 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - `--balance <ADDRESS>`: Check balance for any address (40-char hex, 20 bytes) - Works with any address, no private key needed
 - `--get-balance`: Display wallet balance (DEPRECATED - requires `--wallet-seed` and `--db`, use `--balance` instead)
 
-### Placeholders (Not Yet Implemented)
+### RPC
 
 - `--rpc <ADDR>`: RPC server bind address (default: `127.0.0.1:27447`)
+
+### Placeholders (Not Yet Implemented)
+
 - `--socks5 <ADDR>`: SOCKS5 proxy address for network connections
 
 ## Production Readiness Assessment
@@ -545,10 +548,12 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - ✅ P2P networking with automatic peer discovery
 - ✅ Merkle trees and PoW validation
 - ✅ Coinbase transactions and block rewards
+- ✅ Dynamic difficulty adjustment (every 10 blocks, 60-second target)
+- ✅ JSON-RPC 2.0 API server with localhost-only security
+- ✅ Ed25519 signature verification and UTXO validation
 
 **What's Missing (CRITICAL):**
 - ❌ Transaction fees and spam prevention
-- ❌ Dynamic difficulty adjustment
 
 **Major Security Improvements (JUST COMPLETED!):**
 - ✅ **Ed25519 signature verification on all transactions**
@@ -557,7 +562,7 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 
 **Current Status:** Blocks with invalid signatures or missing UTXOs are now **REJECTED**. The chain is significantly more secure!
 
-**Estimated Time to Launch:** 2 critical features remaining, ~3-5 days of focused development.
+**Estimated Time to Launch:** 1 critical feature remaining (transaction fees), ~1-2 days of focused development.
 
 ## Development Status
 
@@ -612,12 +617,17 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - [x] **Transaction broadcasting via --send command** 📡
 - [x] **Automatic peer mesh formation** 🌐
 - [x] **30-second connection heartbeat monitoring** 💓
+- [x] **Dynamic difficulty adjustment** ⛏️
+- [x] **Difficulty adjustment every 10 blocks targeting 60-second block times** ⛏️
+- [x] **Difficulty validation when accepting blocks** ⛏️
+- [x] **JSON-RPC 2.0 API server** 🌐
+- [x] **RPC methods for chain queries, transactions, wallet, and network info** 🌐
 
 ### Launch Blockers 🚨 (Must Have for Production)
 - [x] **Wire up signature verification when processing blocks** ✅ DONE!
 - [x] **Wire up UTXO validation when accepting blocks** ✅ DONE!
+- [x] **Difficulty adjustment algorithm** ✅ DONE!
 - [ ] **Transaction fees and fee validation** (prevents spam attacks)
-- [ ] **Difficulty adjustment algorithm** (required for real PoW security)
 
 ### Nice to Have (Can Launch Without)
 - [x] **Fork resolution and reorganization** ✅ DONE!
@@ -625,6 +635,7 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - [x] **HD wallets (hierarchical derivation)** ✅ DONE!
 - [x] **Persistent wallet files** ✅ DONE! (encrypted wallet.dat files)
 - [x] **Wallet encryption** ✅ DONE! (BLAKE3-based password encryption)
+- [x] **RPC/API interface** ✅ DONE! (JSON-RPC 2.0 server)
 - [ ] Full script execution (simplified P2PKH works for now)
 
 ### Future Improvements 💡
@@ -656,7 +667,7 @@ This is a nice-to-have improvement but NOT required for launch.
 
 ### Planned 📋
 
-- [ ] RPC interface for wallet integration
+- [ ] Transaction fees and spam prevention
 - [ ] SOCKS5 proxy support for Tor integration
 - [ ] Stealth addresses and payment commitments
 - [ ] Compact block relay
