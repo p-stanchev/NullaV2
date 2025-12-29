@@ -199,10 +199,24 @@ impl Keypair {
         Address::p2pkh_from_public_key(&self.public_key())
     }
 
-    /// Sign a transaction.
+    /// Sign a transaction with chain ID for replay protection.
     ///
-    /// This creates a signature over the transaction data (excluding signatures).
-    pub fn sign_transaction(&self, tx: &Tx) -> Result<Vec<u8>> {
+    /// This creates a signature over the transaction data including the chain ID,
+    /// preventing transactions from being replayed on different chains or forks.
+    ///
+    /// # Arguments
+    /// * `tx` - The transaction to sign
+    /// * `chain_id` - The 4-byte chain identifier
+    pub fn sign_transaction(&self, tx: &Tx, chain_id: &[u8; 4]) -> Result<Vec<u8>> {
+        let sighash = compute_sighash(tx, chain_id)?;
+        let signature = self.signing_key.sign(&sighash);
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    /// Legacy method for backward compatibility (without chain ID).
+    /// WARNING: This is insecure and should not be used in production!
+    #[deprecated(note = "Use sign_transaction with chain_id for replay protection")]
+    pub fn sign_transaction_legacy(&self, tx: &Tx) -> Result<Vec<u8>> {
         let tx_data = bincode::serialize(tx)?;
         let signature = self.signing_key.sign(&tx_data);
         Ok(signature.to_bytes().to_vec())
@@ -317,11 +331,46 @@ impl Wallet {
         &self.keypair
     }
 
-    /// Create and sign a transaction.
+    /// Create and sign a transaction with replay protection.
     ///
     /// This is a helper that creates a transaction with the given inputs and outputs,
-    /// then signs all inputs with this wallet's keypair.
+    /// then signs all inputs with this wallet's keypair including the chain ID.
+    ///
+    /// # Arguments
+    /// * `inputs` - Transaction inputs
+    /// * `outputs` - Transaction outputs
+    /// * `lock_time` - Locktime value
+    /// * `chain_id` - 4-byte chain identifier for replay protection
     pub fn create_transaction(
+        &self,
+        inputs: Vec<TxIn>,
+        outputs: Vec<TxOut>,
+        lock_time: u64,
+        chain_id: &[u8; 4],
+    ) -> Result<Tx> {
+        let mut tx = Tx {
+            version: 1,
+            inputs,
+            outputs,
+            lock_time,
+        };
+
+        // Sign each input with the wallet's keypair and add the public key.
+        let signature = self.keypair.sign_transaction(&tx, chain_id)?;
+        let pubkey_bytes = self.keypair.public_key().to_bytes().to_vec();
+
+        for input in &mut tx.inputs {
+            input.sig = signature.clone();
+            input.pubkey = pubkey_bytes.clone();
+        }
+
+        Ok(tx)
+    }
+
+    /// Legacy transaction creation without chain ID.
+    /// WARNING: This is insecure and vulnerable to replay attacks!
+    #[deprecated(note = "Use create_transaction with chain_id for replay protection")]
+    pub fn create_transaction_legacy(
         &self,
         inputs: Vec<TxIn>,
         outputs: Vec<TxOut>,
@@ -334,8 +383,8 @@ impl Wallet {
             lock_time,
         };
 
-        // Sign each input with the wallet's keypair and add the public key.
-        let signature = self.keypair.sign_transaction(&tx)?;
+        #[allow(deprecated)]
+        let signature = self.keypair.sign_transaction_legacy(&tx)?;
         let pubkey_bytes = self.keypair.public_key().to_bytes().to_vec();
 
         for input in &mut tx.inputs {
@@ -394,10 +443,41 @@ pub fn create_coinbase(recipient: &Address, block_height: u64, reward_atoms: u64
     }
 }
 
-/// Verify an Ed25519 signature on a transaction.
+/// Compute a sighash (signature hash) for a transaction.
+///
+/// The sighash includes:
+/// - Chain ID (4 bytes) - prevents replay across chains
+/// - Transaction version, inputs, outputs, lock_time (bincode serialized)
+///
+/// This implements a simplified version of BIP-143 style sighashing.
+pub fn compute_sighash(tx: &Tx, chain_id: &[u8; 4]) -> Result<Vec<u8>> {
+    let mut hasher = blake3::Hasher::new();
+
+    // Include chain ID first for replay protection
+    hasher.update(chain_id);
+
+    // Serialize the transaction (this excludes signatures since they're cleared during signing)
+    let tx_data = bincode::serialize(tx)?;
+    hasher.update(&tx_data);
+
+    Ok(hasher.finalize().as_bytes().to_vec())
+}
+
+/// Verify an Ed25519 signature on a transaction with chain ID.
 ///
 /// Returns Ok(()) if the signature is valid, Err otherwise.
-pub fn verify_signature(tx: &Tx, signature_bytes: &[u8], public_key: &VerifyingKey) -> Result<()> {
+///
+/// # Arguments
+/// * `tx` - The transaction to verify
+/// * `signature_bytes` - The Ed25519 signature (64 bytes)
+/// * `public_key` - The Ed25519 public key
+/// * `chain_id` - The 4-byte chain identifier for replay protection
+pub fn verify_signature(
+    tx: &Tx,
+    signature_bytes: &[u8],
+    public_key: &VerifyingKey,
+    chain_id: &[u8; 4],
+) -> Result<()> {
     // Parse the signature (64 bytes for Ed25519)
     if signature_bytes.len() != 64 {
         return Err(WalletError::InvalidSignature);
@@ -409,10 +489,30 @@ pub fn verify_signature(tx: &Tx, signature_bytes: &[u8], public_key: &VerifyingK
             .map_err(|_| WalletError::InvalidSignature)?,
     );
 
-    // Serialize transaction for verification (same as signing)
-    let tx_data = bincode::serialize(tx)?;
+    // Compute sighash with chain ID
+    let sighash = compute_sighash(tx, chain_id)?;
 
     // Verify the signature
+    public_key
+        .verify(&sighash, &signature)
+        .map_err(|_| WalletError::InvalidSignature)
+}
+
+/// Legacy signature verification without chain ID.
+/// WARNING: This is insecure and vulnerable to replay attacks!
+#[deprecated(note = "Use verify_signature with chain_id for replay protection")]
+pub fn verify_signature_legacy(tx: &Tx, signature_bytes: &[u8], public_key: &VerifyingKey) -> Result<()> {
+    if signature_bytes.len() != 64 {
+        return Err(WalletError::InvalidSignature);
+    }
+
+    let signature = Signature::from_bytes(
+        signature_bytes
+            .try_into()
+            .map_err(|_| WalletError::InvalidSignature)?,
+    );
+
+    let tx_data = bincode::serialize(tx)?;
     public_key
         .verify(&tx_data, &signature)
         .map_err(|_| WalletError::InvalidSignature)
@@ -431,38 +531,117 @@ pub fn extract_address_from_script(script_pubkey: &[u8]) -> Option<Address> {
 /// Encrypted wallet file format.
 ///
 /// The wallet file contains:
-/// - 32 bytes: salt for password hashing
-/// - 32 bytes: encrypted master seed (XOR with password-derived key)
+/// - 32 bytes: salt for Argon2id key derivation
+/// - 12 bytes: nonce for ChaCha20-Poly1305
+/// - 48 bytes: encrypted seed (32 bytes) + authentication tag (16 bytes)
 /// - 1 byte: wallet type (0 = simple, 1 = HD)
+/// - 4 bytes: Argon2id parameters (for future upgradability)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WalletFile {
     salt: [u8; 32],
-    encrypted_seed: [u8; 32],
+    nonce: [u8; 12],
+    ciphertext: Vec<u8>, // 32 bytes seed + 16 bytes auth tag = 48 bytes
     is_hd: bool,
+    /// Argon2id parameters: [memory_cost_kb (3 bytes), iterations (1 byte)]
+    kdf_params: [u8; 4],
 }
 
-/// Derive an encryption key from a password using BLAKE3.
-fn derive_key_from_password(password: &str, salt: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(password.as_bytes());
-    hasher.update(salt);
-    *hasher.finalize().as_bytes()
+/// Argon2id parameters for key derivation
+const ARGON2_MEMORY_COST: u32 = 65536; // 64 MB
+const ARGON2_TIME_COST: u32 = 3;       // 3 iterations
+const ARGON2_PARALLELISM: u32 = 4;      // 4 parallel lanes
+
+/// Derive an encryption key from a password using Argon2id.
+///
+/// This is a memory-hard key derivation function designed to resist
+/// GPU and ASIC-based brute-force attacks.
+fn derive_key_from_password(password: &str, salt: &[u8; 32]) -> Result<[u8; 32]> {
+    use argon2::{Argon2, Algorithm, Version, Params};
+
+    let params = Params::new(
+        ARGON2_MEMORY_COST,
+        ARGON2_TIME_COST,
+        ARGON2_PARALLELISM,
+        Some(32), // output length
+    ).map_err(|e| WalletError::InvalidInput(format!("Argon2 params error: {}", e)))?;
+
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut output_key = [0u8; 32];
+    argon2.hash_password_into(password.as_bytes(), salt, &mut output_key)
+        .map_err(|e| WalletError::InvalidInput(format!("Argon2 hash error: {}", e)))?;
+
+    Ok(output_key)
 }
 
-/// Encrypt a seed with a password using XOR encryption.
-fn encrypt_seed(seed: &[u8; 32], password: &str, salt: &[u8; 32]) -> [u8; 32] {
-    let key = derive_key_from_password(password, salt);
-    let mut encrypted = [0u8; 32];
-    for i in 0..32 {
-        encrypted[i] = seed[i] ^ key[i];
+/// Encrypt a seed with a password using ChaCha20-Poly1305.
+///
+/// ChaCha20-Poly1305 provides authenticated encryption, ensuring both
+/// confidentiality and integrity of the encrypted data.
+fn encrypt_seed(seed: &[u8; 32], password: &str, salt: &[u8; 32]) -> Result<(Vec<u8>, [u8; 12])> {
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit},
+        ChaCha20Poly1305, Nonce,
+    };
+    use zeroize::Zeroize;
+
+    // Derive encryption key from password
+    let mut key = derive_key_from_password(password, salt)?;
+
+    // Generate random nonce (number used once)
+    let mut nonce_bytes = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    // Create cipher
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|e| WalletError::InvalidInput(format!("Cipher init error: {}", e)))?;
+
+    // Encrypt the seed
+    let ciphertext = cipher.encrypt(nonce, seed.as_ref())
+        .map_err(|e| WalletError::InvalidInput(format!("Encryption error: {}", e)))?;
+
+    // Zero out the key from memory for security
+    key.zeroize();
+
+    Ok((ciphertext, nonce_bytes))
+}
+
+/// Decrypt a seed with a password using ChaCha20-Poly1305.
+///
+/// Returns an error if the password is incorrect or if the ciphertext
+/// has been tampered with (authentication tag check fails).
+fn decrypt_seed(ciphertext: &[u8], nonce: &[u8; 12], password: &str, salt: &[u8; 32]) -> Result<[u8; 32]> {
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit},
+        ChaCha20Poly1305, Nonce,
+    };
+    use zeroize::Zeroize;
+
+    // Derive encryption key from password
+    let mut key = derive_key_from_password(password, salt)?;
+
+    // Create cipher
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|e| WalletError::InvalidInput(format!("Cipher init error: {}", e)))?;
+
+    let nonce_obj = Nonce::from_slice(nonce);
+
+    // Decrypt and verify authentication tag
+    let plaintext = cipher.decrypt(nonce_obj, ciphertext)
+        .map_err(|_| WalletError::InvalidPassword)?;
+
+    // Zero out the key from memory
+    key.zeroize();
+
+    // Ensure we got exactly 32 bytes back
+    if plaintext.len() != 32 {
+        return Err(WalletError::InvalidInput("Decrypted seed has wrong length".into()));
     }
-    encrypted
-}
 
-/// Decrypt a seed with a password using XOR encryption.
-fn decrypt_seed(encrypted: &[u8; 32], password: &str, salt: &[u8; 32]) -> [u8; 32] {
-    // XOR encryption is symmetric, so decrypt is the same as encrypt
-    encrypt_seed(encrypted, password, salt)
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&plaintext);
+    Ok(seed)
 }
 
 impl Wallet {
@@ -495,14 +674,25 @@ impl Wallet {
             (*self.keypair.secret_bytes(), false)
         };
 
-        // Encrypt the seed
-        let encrypted_seed = encrypt_seed(&seed, password, &salt);
+        // Encrypt the seed with ChaCha20-Poly1305 + Argon2id
+        let (ciphertext, nonce) = encrypt_seed(&seed, password, &salt)?;
+
+        // Store KDF parameters for future upgradability
+        let memory_kb_bytes = (ARGON2_MEMORY_COST as u32).to_le_bytes();
+        let kdf_params = [
+            memory_kb_bytes[0],
+            memory_kb_bytes[1],
+            memory_kb_bytes[2],
+            ARGON2_TIME_COST as u8,
+        ];
 
         // Create wallet file
         let wallet_file = WalletFile {
             salt,
-            encrypted_seed,
+            nonce,
+            ciphertext,
             is_hd,
+            kdf_params,
         };
 
         // Serialize and write to file
@@ -541,8 +731,13 @@ impl Wallet {
         let data = fs::read(path)?;
         let wallet_file: WalletFile = bincode::deserialize(&data)?;
 
-        // Decrypt the seed
-        let decrypted_seed = decrypt_seed(&wallet_file.encrypted_seed, password, &wallet_file.salt);
+        // Decrypt the seed with authentication verification
+        let decrypted_seed = decrypt_seed(
+            &wallet_file.ciphertext,
+            &wallet_file.nonce,
+            password,
+            &wallet_file.salt
+        )?;
 
         // Create wallet from decrypted seed
         if wallet_file.is_hd {

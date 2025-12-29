@@ -26,6 +26,7 @@ pub struct RpcContext {
     pub network_tx: Sender<NetworkCommand>,
     pub wallet: Option<Arc<RwLock<Wallet>>>,
     pub start_time: Instant,
+    pub chain_id: [u8; 4],
 }
 
 /// Spawns the JSON-RPC 2.0 HTTP server

@@ -495,8 +495,9 @@ async fn main() -> Result<()> {
             });
         }
 
-        // Create and sign the transaction.
-        let tx = match wallet.create_transaction(inputs, outputs, 0) {
+        // Create and sign the transaction with chain_id for replay protection.
+        let chain_id = chain_id_bytes(&args.chain_id);
+        let tx = match wallet.create_transaction(inputs, outputs, 0, &chain_id) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("Error creating transaction: {}", e);
@@ -507,7 +508,7 @@ async fn main() -> Result<()> {
         let txid = nulla_core::tx_id(&tx);
 
         // Validate transaction signatures before broadcasting.
-        if let Err(e) = db.verify_tx_signatures(&tx) {
+        if let Err(e) = db.verify_tx_signatures(&tx, &chain_id) {
             eprintln!("Error: Transaction signature verification failed: {}", e);
             std::process::exit(1);
         }
@@ -709,6 +710,7 @@ async fn main() -> Result<()> {
             db.clone(),
             sync_progress.clone(),
             args.seed,
+            chain_id,
         ));
 
         // Spawn periodic peer sync task
@@ -755,6 +757,7 @@ async fn main() -> Result<()> {
             network_tx: cmd_tx.clone(),
             wallet: wallet_arc,
             start_time: std::time::Instant::now(),
+            chain_id,
         };
 
         match nulla_rpc::spawn_rpc_server(args.rpc.clone(), rpc_ctx).await {
@@ -817,7 +820,15 @@ async fn handle_network_events(
     db: NullaDb,
     sync_progress: Arc<Mutex<Option<ProgressBar>>>,
     seed_mode: bool,
+    chain_id: [u8; 4],
 ) {
+    use std::collections::HashSet;
+    use nulla_core::OutPoint;
+
+    // SECURITY: Track spent outpoints in mempool to prevent double-spend attacks
+    // This prevents adding conflicting transactions to the mempool
+    let mut mempool_spent: HashSet<OutPoint> = HashSet::new();
+
     while let Ok(evt) = rx.recv().await {
         match evt {
             NetworkEvent::TxInv { from, txid } => {
@@ -843,8 +854,27 @@ async fn handle_network_events(
                     continue;
                 }
 
-                // Validate transaction signatures
-                if let Err(e) = db.verify_tx_signatures(&tx) {
+                // SECURITY: Check for double-spend in mempool before validation
+                // This prevents the same UTXO from being spent by multiple mempool transactions
+                let mut has_double_spend = false;
+                for input in &tx.inputs {
+                    if mempool_spent.contains(&input.prevout) {
+                        warn!(
+                            "rejected transaction {}: double-spend detected in mempool (outpoint {}:{})",
+                            hex::encode(txid),
+                            hex::encode(input.prevout.txid),
+                            input.prevout.vout
+                        );
+                        has_double_spend = true;
+                        break;
+                    }
+                }
+                if has_double_spend {
+                    continue;
+                }
+
+                // Validate transaction signatures with chain_id for replay protection
+                if let Err(e) = db.verify_tx_signatures(&tx, &chain_id) {
                     warn!("received invalid transaction (signature verification failed): {e}");
                     continue;
                 }
@@ -878,6 +908,11 @@ async fn handle_network_events(
                 if let Err(e) = db.put_mempool_tx(&tx) {
                     warn!("failed to add transaction to mempool: {e}");
                     continue;
+                }
+
+                // SECURITY: Mark all inputs as spent in mempool tracker
+                for input in &tx.inputs {
+                    mempool_spent.insert(input.prevout.clone());
                 }
 
                 info!(
@@ -1005,7 +1040,7 @@ async fn handle_network_events(
                 }
             }
             NetworkEvent::FullBlock { from, block } => {
-                process_full_block(&db, &sync_progress, block, Some(from)).await;
+                process_full_block(&db, &sync_progress, block, Some(from), &chain_id).await;
             }
             NetworkEvent::Request { peer, req, channel } => {
                 info!("request from {peer:?}: {:?}", req);
@@ -1022,10 +1057,27 @@ async fn handle_network_events(
                 if let protocol::Resp::Mempool { txs } = &resp {
                     info!("received {} mempool transactions from {peer}", txs.len());
                     for tx in txs {
+                        // SECURITY: Check for double-spend in mempool before adding
+                        let mut has_double_spend = false;
+                        for input in &tx.inputs {
+                            if mempool_spent.contains(&input.prevout) {
+                                let txid = nulla_core::tx_id(tx);
+                                warn!(
+                                    "rejected mempool sync tx {}: double-spend detected",
+                                    hex::encode(txid)
+                                );
+                                has_double_spend = true;
+                                break;
+                            }
+                        }
+                        if has_double_spend {
+                            continue;
+                        }
+
                         // Validate transaction before adding to mempool
                         match db.validate_tx_inputs(tx) {
                             Ok(total_input) => {
-                                if let Err(e) = db.verify_tx_signatures(tx) {
+                                if let Err(e) = db.verify_tx_signatures(tx, &chain_id) {
                                     warn!("invalid signature in mempool tx: {}", e);
                                     continue;
                                 }
@@ -1041,6 +1093,10 @@ async fn handle_network_events(
                                 if let Err(e) = db.put_mempool_tx(tx) {
                                     warn!("failed to add mempool tx {}: {}", hex::encode(txid), e);
                                 } else {
+                                    // SECURITY: Mark inputs as spent in mempool tracker
+                                    for input in &tx.inputs {
+                                        mempool_spent.insert(input.prevout.clone());
+                                    }
                                     info!("added mempool tx {} from peer", hex::encode(txid));
                                 }
                             }
@@ -1093,7 +1149,7 @@ async fn handle_network_events(
                         }
                         protocol::Resp::Block { block } => {
                             if let Some(block) = block {
-                                process_full_block(&db, &sync_progress, block, Some(peer)).await;
+                                process_full_block(&db, &sync_progress, block, Some(peer), &chain_id).await;
                             }
                         }
                         _ => {}
@@ -1232,6 +1288,7 @@ async fn process_full_block(
     sync_progress: &Arc<Mutex<Option<ProgressBar>>>,
     block: nulla_core::Block,
     from: Option<libp2p::PeerId>,
+    chain_id: &[u8; 4],
 ) {
     let block_id = nulla_core::block_id(&block);
     if let Some(peer) = from {
@@ -1264,8 +1321,8 @@ async fn process_full_block(
         return;
     }
 
-    // Validate all transactions in parallel (2-4x faster on multi-core CPUs)
-    let total_fees = match db.validate_block_txs_parallel(&block.txs) {
+    // Validate all transactions in parallel with replay protection (2-4x faster on multi-core CPUs)
+    let total_fees = match db.validate_block_txs_parallel(&block.txs, chain_id) {
         Ok(fees) => fees,
         Err(e) => {
             warn!("block rejected: parallel validation failed: {e}");

@@ -8,8 +8,10 @@ use crate::protocol;
 
 pub const PROTOCOL_NAME: &str = "/nulla/reqres/1";
 
-const REQUEST_SIZE_MAXIMUM: u64 = 1024 * 1024;
-const RESPONSE_SIZE_MAXIMUM: u64 = 2 * 1024 * 1024;
+// SECURITY: Maximum message sizes to prevent memory exhaustion attacks
+// These limits prevent attackers from sending oversized messages that could exhaust node memory
+const REQUEST_SIZE_MAXIMUM: u64 = protocol::MAX_MESSAGE_SIZE as u64;  // 16 MB
+const RESPONSE_SIZE_MAXIMUM: u64 = protocol::MAX_MESSAGE_SIZE as u64; // 16 MB
 
 #[derive(Clone, Default)]
 pub struct NullaCodec;
@@ -26,6 +28,15 @@ impl request_response::Codec for NullaCodec {
     {
         let mut buf = Vec::new();
         io.take(REQUEST_SIZE_MAXIMUM).read_to_end(&mut buf).await?;
+
+        // SECURITY: Check size before deserialization
+        if buf.len() > protocol::MAX_MESSAGE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Request too large: {} bytes (max {})", buf.len(), protocol::MAX_MESSAGE_SIZE)
+            ));
+        }
+
         bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
@@ -39,6 +50,15 @@ impl request_response::Codec for NullaCodec {
     {
         let mut buf = Vec::new();
         io.take(RESPONSE_SIZE_MAXIMUM).read_to_end(&mut buf).await?;
+
+        // SECURITY: Check size before deserialization
+        if buf.len() > protocol::MAX_MESSAGE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Response too large: {} bytes (max {})", buf.len(), protocol::MAX_MESSAGE_SIZE)
+            ));
+        }
+
         bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 

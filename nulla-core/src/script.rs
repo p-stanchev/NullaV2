@@ -280,15 +280,65 @@ pub enum ScriptError {
     VerificationFailed,
 }
 
-/// Script interpreter for validating transactions
+/// Resource limits for script execution to prevent DoS attacks
+pub mod limits {
+    /// Maximum number of operations allowed in a single script execution
+    pub const MAX_OPERATIONS: usize = 10_000;
+
+    /// Maximum stack depth to prevent memory exhaustion
+    pub const MAX_STACK_DEPTH: usize = 1_000;
+
+    /// Maximum execution time for a single script (in milliseconds)
+    pub const MAX_EXECUTION_TIME_MS: u128 = 1_000;
+}
+
+/// Script interpreter for validating transactions with resource limits
 pub struct ScriptInterpreter {
     stack: Vec<Vec<u8>>,
+    /// Number of operations executed so far
+    op_count: usize,
+    /// Timestamp when execution started
+    start_time: std::time::Instant,
 }
 
 impl ScriptInterpreter {
     /// Create a new script interpreter
     pub fn new() -> Self {
-        Self { stack: Vec::new() }
+        Self {
+            stack: Vec::new(),
+            op_count: 0,
+            start_time: std::time::Instant::now(),
+        }
+    }
+
+    /// Check resource limits and increment operation counter
+    fn check_limits(&mut self) -> Result<(), ScriptError> {
+        // Increment operation count
+        self.op_count += 1;
+
+        // Check operation limit
+        if self.op_count > limits::MAX_OPERATIONS {
+            return Err(ScriptError::ExecutionFailed(
+                format!("Operation limit exceeded: {} > {}", self.op_count, limits::MAX_OPERATIONS)
+            ));
+        }
+
+        // Check stack depth limit
+        if self.stack.len() > limits::MAX_STACK_DEPTH {
+            return Err(ScriptError::ExecutionFailed(
+                format!("Stack depth limit exceeded: {} > {}", self.stack.len(), limits::MAX_STACK_DEPTH)
+            ));
+        }
+
+        // Check execution time limit
+        let elapsed = self.start_time.elapsed().as_millis();
+        if elapsed > limits::MAX_EXECUTION_TIME_MS {
+            return Err(ScriptError::ExecutionFailed(
+                format!("Execution time limit exceeded: {} ms > {} ms", elapsed, limits::MAX_EXECUTION_TIME_MS)
+            ));
+        }
+
+        Ok(())
     }
 
     /// Execute a P2PKH script verification
@@ -296,16 +346,20 @@ impl ScriptInterpreter {
     /// Validates: scriptSig (signature + pubkey) satisfies scriptPubKey
     ///
     /// # Arguments
-    /// * `script_sig` - Input signature data (signature bytes + pubkey bytes)
+    /// * `signature` - Input signature data (64 bytes for Ed25519)
+    /// * `pubkey` - Public key (32 bytes for Ed25519)
     /// * `script_pubkey` - Output script (P2PKH format)
-    /// * `tx_data` - Serialized transaction data to verify signature against
+    /// * `sighash` - The signature hash (already includes chain ID and tx data)
     pub fn verify_p2pkh(
         &mut self,
         signature: &[u8],
         pubkey: &[u8],
         script_pubkey: &Script,
-        tx_data: &[u8],
+        sighash: &[u8],
     ) -> Result<(), ScriptError> {
+        // Check resource limits
+        self.check_limits()?;
+
         // Extract the expected address hash from scriptPubKey
         let expected_hash = script_pubkey
             .extract_hash()
@@ -340,8 +394,8 @@ impl ScriptInterpreter {
                 .map_err(|_| ScriptError::InvalidSignature)?
         ).map_err(|_| ScriptError::InvalidSignature)?;
 
-        // Verify the signature
-        vk.verify(tx_data, &sig)
+        // Verify the signature against the sighash
+        vk.verify(sighash, &sig)
             .map_err(|_| ScriptError::SignatureVerificationFailed)?;
 
         Ok(())
@@ -356,14 +410,17 @@ impl ScriptInterpreter {
     /// * `signatures` - Array of signatures
     /// * `redeem_script` - The actual script being redeemed (multisig script)
     /// * `script_pubkey` - Output script (P2SH format - contains script hash)
-    /// * `tx_data` - Serialized transaction data to verify signatures against
+    /// * `sighash` - The signature hash (already includes chain ID and tx data)
     pub fn verify_p2sh(
         &mut self,
         signatures: &[Vec<u8>],
         redeem_script: &Script,
         script_pubkey: &Script,
-        tx_data: &[u8],
+        sighash: &[u8],
     ) -> Result<(), ScriptError> {
+        // Check resource limits
+        self.check_limits()?;
+
         // Extract expected script hash from scriptPubKey
         let expected_script_hash = script_pubkey
             .extract_hash()
@@ -398,7 +455,7 @@ impl ScriptInterpreter {
             let signature = &signatures[sig_index];
 
             // Try to verify this signature with this pubkey
-            if self.verify_signature_with_pubkey(signature, pubkey, tx_data).is_ok() {
+            if self.verify_signature_with_pubkey(signature, pubkey, sighash).is_ok() {
                 verified_count += 1;
                 sig_index += 1;
             }
@@ -414,12 +471,19 @@ impl ScriptInterpreter {
 
     /// Verify a single signature against a public key
     fn verify_signature_with_pubkey(
-        &self,
+        &mut self,
         signature: &[u8],
         pubkey: &[u8; 32],
-        tx_data: &[u8],
+        sighash: &[u8],
     ) -> Result<(), ScriptError> {
         use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+
+        // Check resource limits (signature verification counts as an operation)
+        if self.op_count > limits::MAX_OPERATIONS {
+            return Err(ScriptError::ExecutionFailed(
+                format!("Operation limit exceeded during signature verification")
+            ));
+        }
 
         if signature.len() != 64 {
             return Err(ScriptError::InvalidSignature);
@@ -431,7 +495,7 @@ impl ScriptInterpreter {
         let vk = VerifyingKey::from_bytes(pubkey)
             .map_err(|_| ScriptError::InvalidSignature)?;
 
-        vk.verify(tx_data, &sig)
+        vk.verify(sighash, &sig)
             .map_err(|_| ScriptError::SignatureVerificationFailed)?;
 
         Ok(())

@@ -105,6 +105,8 @@ impl Psbt {
     }
 
     /// Set the redeem script for an input (for P2SH multisig)
+    ///
+    /// This validates that the redeem script is a valid multisig script before storing it.
     pub fn set_input_redeem_script(
         &mut self,
         input_index: usize,
@@ -112,6 +114,33 @@ impl Psbt {
     ) -> Result<(), WalletError> {
         if input_index >= self.inputs.len() {
             return Err(WalletError::InvalidInput("Input index out of bounds".into()));
+        }
+
+        // SECURITY: Validate redeem script before storing to prevent malformed scripts
+        // from causing crashes during finalization
+        let script = nulla_core::Script::new(redeem_script.clone());
+
+        // Verify it's a valid script type (P2PKH, P2SH, or Multisig)
+        match script.script_type() {
+            Some(nulla_core::ScriptType::P2PKH) |
+            Some(nulla_core::ScriptType::P2SH) => {
+                // Valid script type
+            }
+            None => {
+                // For multisig, try to parse it
+                if script.parse_multisig().is_err() {
+                    return Err(WalletError::InvalidInput(
+                        "Redeem script is not a valid P2PKH, P2SH, or multisig script".into()
+                    ));
+                }
+            }
+        }
+
+        // Additional validation: ensure script is not too large (prevent DoS)
+        if redeem_script.len() > 10_000 {
+            return Err(WalletError::InvalidInput(
+                "Redeem script too large (max 10KB)".into()
+            ));
         }
 
         self.inputs[input_index].redeem_script = Some(redeem_script);

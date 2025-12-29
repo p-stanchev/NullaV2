@@ -22,8 +22,8 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
             return Err(RpcError::InvalidTransaction(e.to_string()).into_error_object());
         }
 
-        // Verify signatures
-        if let Err(e) = ctx.db.verify_tx_signatures(&tx) {
+        // Verify signatures with chain_id for replay protection
+        if let Err(e) = ctx.db.verify_tx_signatures(&tx, &ctx.chain_id) {
             return Err(RpcError::InvalidTransaction(format!("Signature verification failed: {}", e)).into_error_object());
         }
 

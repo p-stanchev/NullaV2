@@ -136,6 +136,10 @@ pub enum ValidationError {
     UtxoAlreadySpent,
     #[error("invalid coinbase")]
     InvalidCoinbase,
+    #[error("block too large: {size} bytes (max {max} bytes)")]
+    BlockTooLarge { size: usize, max: usize },
+    #[error("invalid format")]
+    InvalidFormat,
 }
 
 /// Check if a transaction is a coinbase transaction (first tx in block with null input).
@@ -386,7 +390,12 @@ where
     Ok(())
 }
 
+/// Maximum block size in bytes (4 MB).
+/// This prevents DoS attacks via oversized blocks.
+pub const MAX_BLOCK_SIZE: usize = 4_000_000;
+
 /// Validate a complete block, checking:
+/// - The block size does not exceed MAX_BLOCK_SIZE
 /// - The block contains at least one transaction
 /// - The first transaction is a valid coinbase (basic structure only, not fee validation)
 /// - The merkle root matches the computed root of all transaction IDs
@@ -396,6 +405,18 @@ where
 /// Note: This does NOT validate difficulty adjustment or transaction fees.
 /// Use `validate_difficulty` and fee validation separately when validating blocks from the network.
 pub fn validate_block(block: &Block) -> Result<(), ValidationError> {
+    // SECURITY: Enforce block size limit to prevent DoS attacks
+    let serialized_size = bincode::serialize(block)
+        .map_err(|_| ValidationError::InvalidFormat)?
+        .len();
+
+    if serialized_size > MAX_BLOCK_SIZE {
+        return Err(ValidationError::BlockTooLarge {
+            size: serialized_size,
+            max: MAX_BLOCK_SIZE,
+        });
+    }
+
     if block.txs.is_empty() {
         return Err(ValidationError::EmptyBlock);
     }

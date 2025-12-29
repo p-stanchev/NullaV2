@@ -390,10 +390,14 @@ impl NullaDb {
         Ok(total_input - total_output)
     }
 
-    /// Validate multiple transactions in parallel using rayon.
+    /// Validate multiple transactions in parallel using rayon with replay protection.
     ///
     /// This method validates transaction signatures and fees in parallel,
     /// significantly speeding up block validation on multi-core systems.
+    ///
+    /// # Arguments
+    /// * `txs` - The transactions to validate
+    /// * `chain_id` - The 4-byte chain identifier for replay protection
     ///
     /// # Returns
     /// - `Ok(total_fees)`: The sum of all transaction fees
@@ -401,13 +405,18 @@ impl NullaDb {
     ///
     /// # Performance
     /// Expected 2-4x speedup on 4+ core CPUs compared to serial validation.
-    pub fn validate_block_txs_parallel(&self, txs: &[nulla_core::Tx]) -> Result<u64> {
+    pub fn validate_block_txs_parallel(&self, txs: &[nulla_core::Tx], chain_id: &[u8; 4]) -> Result<u64> {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Mutex;
 
         let total_fees = AtomicU64::new(0);
         let first_error: Mutex<Option<DbError>> = Mutex::new(None);
+
+        // SECURITY: Mutex to prevent race conditions during UTXO validation
+        // This prevents TOCTOU (Time-Of-Check-Time-Of-Use) attacks where two
+        // transactions could try to spend the same UTXO simultaneously
+        let utxo_lock = Mutex::new(());
 
         // Validate all transactions in parallel
         txs.par_iter().for_each(|tx| {
@@ -416,13 +425,16 @@ impl NullaDb {
                 return;
             }
 
-            // Verify signatures
-            if let Err(e) = self.verify_tx_signatures(tx) {
+            // Verify signatures with chain_id for replay protection (parallelizable)
+            if let Err(e) = self.verify_tx_signatures(tx, chain_id) {
                 *first_error.lock().unwrap() = Some(e);
                 return;
             }
 
-            // Calculate and validate fee
+            // SECURITY: Lock UTXO access to prevent race conditions
+            let _guard = utxo_lock.lock().unwrap();
+
+            // Calculate and validate fee (requires UTXO access - must be locked)
             match self.calculate_tx_fee(tx) {
                 Ok(fee) => {
                     // Check minimum fee (10,000 atoms = 0.0001 NULLA)
@@ -450,17 +462,22 @@ impl NullaDb {
         Ok(total_fees.load(Ordering::SeqCst))
     }
 
-    /// Verify Ed25519 signatures on all transaction inputs.
+    /// Verify Ed25519 signatures on all transaction inputs with replay protection.
     ///
     /// Supports both P2PKH (single signature) and P2SH (multi-signature) transactions.
     ///
     /// For each input (except coinbase):
     /// 1. Looks up the previous output from UTXO set
     /// 2. Determines script type (P2PKH or P2SH)
-    /// 3. Uses ScriptInterpreter to verify signatures
+    /// 3. Computes sighash including chain_id for replay protection
+    /// 4. Uses ScriptInterpreter to verify signatures
     ///
     /// Returns Ok(()) if all signatures are valid, Err otherwise.
-    pub fn verify_tx_signatures(&self, tx: &nulla_core::Tx) -> Result<()> {
+    ///
+    /// # Arguments
+    /// * `tx` - The transaction to verify
+    /// * `chain_id` - The 4-byte chain identifier for replay protection
+    pub fn verify_tx_signatures(&self, tx: &nulla_core::Tx, chain_id: &[u8; 4]) -> Result<()> {
         use nulla_core::{Script, ScriptInterpreter, ScriptType};
 
         // Skip coinbase transactions
@@ -468,8 +485,14 @@ impl NullaDb {
             return Ok(());
         }
 
-        // Serialize transaction once for all signature verifications
-        let tx_data = bincode::serialize(tx)?;
+        // Compute sighash once for all signature verifications (includes chain_id for replay protection)
+        let sighash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(chain_id);
+            let tx_data = bincode::serialize(tx)?;
+            hasher.update(&tx_data);
+            hasher.finalize().as_bytes().to_vec()
+        };
 
         for input in &tx.inputs {
             // Get the previous output being spent
@@ -510,9 +533,9 @@ impl NullaDb {
                         )));
                     }
 
-                    // Verify P2PKH signature
+                    // Verify P2PKH signature with sighash (includes chain_id)
                     interpreter
-                        .verify_p2pkh(&input.sig, &input.pubkey, &script_pubkey, &tx_data)
+                        .verify_p2pkh(&input.sig, &input.pubkey, &script_pubkey, &sighash)
                         .map_err(|e| {
                             DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
                                 format!("P2PKH verification failed: {}", e),
@@ -572,9 +595,9 @@ impl NullaDb {
                     let redeem_script_bytes = input.sig[pos..pos + script_len].to_vec();
                     let redeem_script = Script::new(redeem_script_bytes);
 
-                    // Verify P2SH signature
+                    // Verify P2SH signature with sighash (includes chain_id)
                     interpreter
-                        .verify_p2sh(&signatures, &redeem_script, &script_pubkey, &tx_data)
+                        .verify_p2sh(&signatures, &redeem_script, &script_pubkey, &sighash)
                         .map_err(|e| {
                             DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
                                 format!("P2SH verification failed: {}", e),

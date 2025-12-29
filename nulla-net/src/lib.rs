@@ -45,6 +45,11 @@ pub mod protocol {
     /// Maximum transaction size in bytes.
     pub const MAX_TX_SIZE: usize = 100_000;
 
+    /// Maximum network message size in bytes (16 MB).
+    /// This prevents memory exhaustion attacks from oversized messages.
+    /// Set higher than MAX_BLOCK_SIZE to allow for protocol overhead.
+    pub const MAX_MESSAGE_SIZE: usize = 16_000_000;
+
     /// Maximum number of peer addresses in a PeerExchange response.
     pub const MAX_PX_ADDRS: usize = 32;
 
