@@ -13,3 +13,4 @@ bincode.workspace = true
 postcard.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+ed25519-dalek.workspace = true

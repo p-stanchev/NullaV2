@@ -5,9 +5,15 @@
 //! - Cryptographic hashing (BLAKE3)
 //! - Proof-of-work validation
 //! - Merkle tree computation
+//! - Script system for P2PKH and P2SH transactions
+
+pub mod script;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+// Re-export script types for convenience
+pub use script::{OpCode, Script, ScriptError, ScriptInterpreter, ScriptType};
 
 /// Standard hash length (256 bits).
 pub const HASH_LEN: usize = 32;
@@ -246,7 +252,13 @@ pub fn validate_tx_structure(tx: &Tx) -> Result<(), ValidationError> {
 /// - Exactly one input with a null outpoint
 /// - At least one output
 /// - Output values don't overflow
-pub fn validate_coinbase(tx: &Tx) -> Result<(), ValidationError> {
+/// - Coinbase doesn't claim more than block_reward + total_fees
+///
+/// # Arguments
+/// * `tx` - The coinbase transaction to validate
+/// * `block_reward` - The fixed block reward (e.g., 800,000,000 atoms)
+/// * `total_fees` - Sum of all transaction fees in the block
+pub fn validate_coinbase(tx: &Tx, block_reward: u64, total_fees: u64) -> Result<(), ValidationError> {
     if tx.inputs.len() != 1 {
         return Err(ValidationError::EmptyInputs);
     }
@@ -258,11 +270,20 @@ pub fn validate_coinbase(tx: &Tx) -> Result<(), ValidationError> {
     }
 
     // Check that output values don't overflow
-    let mut total: u64 = 0;
+    let mut total_output: u64 = 0;
     for output in &tx.outputs {
-        total = total
+        total_output = total_output
             .checked_add(output.value_atoms)
             .ok_or(ValidationError::ValueOverflow)?;
+    }
+
+    // Coinbase can claim up to block_reward + total_fees
+    let max_coinbase = block_reward
+        .checked_add(total_fees)
+        .ok_or(ValidationError::ValueOverflow)?;
+
+    if total_output > max_coinbase {
+        return Err(ValidationError::InvalidCoinbase);
     }
 
     Ok(())
@@ -367,20 +388,22 @@ where
 
 /// Validate a complete block, checking:
 /// - The block contains at least one transaction
-/// - The first transaction is a valid coinbase
+/// - The first transaction is a valid coinbase (basic structure only, not fee validation)
 /// - The merkle root matches the computed root of all transaction IDs
 /// - The proof-of-work is valid
 /// - Basic transaction structure for all transactions
 ///
-/// Note: This does NOT validate difficulty adjustment. Use `validate_difficulty`
-/// separately when validating blocks from the network.
+/// Note: This does NOT validate difficulty adjustment or transaction fees.
+/// Use `validate_difficulty` and fee validation separately when validating blocks from the network.
 pub fn validate_block(block: &Block) -> Result<(), ValidationError> {
     if block.txs.is_empty() {
         return Err(ValidationError::EmptyBlock);
     }
 
-    // First transaction must be a coinbase
-    validate_coinbase(&block.txs[0])?;
+    // First transaction must be a coinbase (basic structure validation only)
+    // Pass 0 for fees since this is just structure validation
+    // Real fee validation happens at the database level with UTXO access
+    validate_coinbase(&block.txs[0], u64::MAX, 0)?;
 
     // Remaining transactions must be regular (no coinbase inputs)
     for tx in &block.txs[1..] {
@@ -406,10 +429,12 @@ pub fn validate_block(block: &Block) -> Result<(), ValidationError> {
 /// These values control how often difficulty adjusts and the target block time.
 pub mod difficulty {
     /// Number of blocks between difficulty adjustments.
-    pub const ADJUSTMENT_INTERVAL: u64 = 10;
+    /// Increased from 10 to 60 blocks for more stable adjustments with faster block time.
+    pub const ADJUSTMENT_INTERVAL: u64 = 60;
 
     /// Target time per block in seconds.
-    pub const TARGET_BLOCK_TIME: u64 = 60;
+    /// Reduced from 60s to 10s for 6x higher throughput.
+    pub const TARGET_BLOCK_TIME: u64 = 10;
 
     /// Maximum difficulty adjustment factor (4x).
     /// Prevents difficulty from changing too rapidly.

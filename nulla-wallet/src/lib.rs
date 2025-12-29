@@ -3,9 +3,14 @@
 //! This crate provides:
 //! - Key generation (Ed25519 keypairs)
 //! - HD (Hierarchical Deterministic) wallet support
-//! - Address derivation from public keys
+//! - Address derivation from public keys (P2PKH and P2SH)
+//! - Multi-signature wallet support
 //! - Transaction signing
 //! - UTXO management for wallet balances
+
+pub mod address;
+pub mod multisig;
+pub mod psbt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use nulla_core::{OutPoint, Tx, TxIn, TxOut};
@@ -15,11 +20,22 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+// Re-export address types
+pub use address::{Address, AddressVersion};
+// Re-export multisig types
+pub use multisig::{MultiSigConfig, create_2_of_2, create_2_of_3, create_multisig};
+// Re-export PSBT types
+pub use psbt::{Psbt, PsbtInput, PsbtOutput};
+
 /// Number of atoms per NULLA.
 pub const ATOMS_PER_NULLA: u64 = 100_000_000;
 
 /// Block reward in atoms (8 NULLA = 800,000,000 atoms).
 pub const BLOCK_REWARD_ATOMS: u64 = 8 * ATOMS_PER_NULLA;
+
+/// Minimum transaction fee in atoms to prevent spam (0.0001 NULLA = 10,000 atoms).
+/// This is 1/80,000th of the block reward, making it cheap but not free.
+pub const MIN_TX_FEE_ATOMS: u64 = 10_000;
 
 /// Convert atoms to NULLA with 8 decimal places.
 pub fn atoms_to_nulla(atoms: u64) -> f64 {
@@ -44,6 +60,8 @@ pub enum WalletError {
     InvalidPassword,
     #[error("wallet file not found")]
     WalletNotFound,
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
     #[error(transparent)]
@@ -173,12 +191,12 @@ impl Keypair {
         self.signing_key.verifying_key()
     }
 
-    /// Get the address derived from the public key.
+    /// Get the P2PKH address derived from the public key.
     ///
-    /// Address format: BLAKE3(public_key)[0..20]
-    /// This creates a 20-byte address similar to Bitcoin/Ethereum.
+    /// Address format: version byte (0x00) + BLAKE3(public_key)[0..20]
+    /// This creates a versioned P2PKH address.
     pub fn address(&self) -> Address {
-        Address::from_public_key(&self.public_key())
+        Address::p2pkh_from_public_key(&self.public_key())
     }
 
     /// Sign a transaction.
@@ -196,58 +214,7 @@ impl Keypair {
     }
 }
 
-/// A 20-byte address derived from a public key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Address(pub [u8; 20]);
-
-impl Address {
-    /// Derive an address from a public key using BLAKE3.
-    pub fn from_public_key(public_key: &VerifyingKey) -> Self {
-        let pubkey_bytes = public_key.to_bytes();
-        let hash = blake3::hash(&pubkey_bytes);
-        let hash_bytes: &[u8; 32] = hash.as_bytes();
-        let mut addr = [0u8; 20];
-        addr.copy_from_slice(&hash_bytes[0..20]);
-        Address(addr)
-    }
-
-    /// Convert address to hex string.
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
-    }
-
-    /// Parse address from hex string.
-    pub fn from_hex(s: &str) -> Option<Self> {
-        let bytes = hex::decode(s).ok()?;
-        if bytes.len() != 20 {
-            return None;
-        }
-        let mut addr = [0u8; 20];
-        addr.copy_from_slice(&bytes);
-        Some(Address(addr))
-    }
-
-    /// Convert address to a script_pubkey for TxOut.
-    ///
-    /// Format: [OP_DUP, OP_HASH160, <20-byte address>, OP_EQUALVERIFY, OP_CHECKSIG]
-    /// This is a simplified P2PKH-like script.
-    pub fn to_script_pubkey(&self) -> Vec<u8> {
-        let mut script = Vec::with_capacity(25);
-        script.push(0x76); // OP_DUP
-        script.push(0xa9); // OP_HASH160
-        script.push(0x14); // Push 20 bytes
-        script.extend_from_slice(&self.0);
-        script.push(0x88); // OP_EQUALVERIFY
-        script.push(0xac); // OP_CHECKSIG
-        script
-    }
-}
-
-impl std::fmt::Display for Address {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_hex())
-    }
-}
+// Old Address type removed - now using the new versioned Address from address module
 
 /// Simple wallet for managing keys and creating transactions.
 #[derive(Clone)]
@@ -451,31 +418,14 @@ pub fn verify_signature(tx: &Tx, signature_bytes: &[u8], public_key: &VerifyingK
         .map_err(|_| WalletError::InvalidSignature)
 }
 
-/// Extract public key from a script_pubkey (P2PKH-like format).
+/// Extract address from a script_pubkey.
 ///
-/// Returns None if the script is not in the expected format.
-/// Format: [OP_DUP, OP_HASH160, <20-byte address>, OP_EQUALVERIFY, OP_CHECKSIG]
-///
-/// Note: This is a simplified version. A full implementation would actually
-/// execute the script and verify the signature. For now, we just extract
-/// the address and verify signatures separately.
+/// Returns None if the script is not in a recognized format (P2PKH or P2SH).
+/// Supports both:
+/// - P2PKH: [OP_DUP, OP_HASH160, <20-byte address>, OP_EQUALVERIFY, OP_CHECKSIG]
+/// - P2SH:  [OP_HASH160, <20-byte script-hash>, OP_EQUAL]
 pub fn extract_address_from_script(script_pubkey: &[u8]) -> Option<Address> {
-    if script_pubkey.len() != 25 {
-        return None;
-    }
-
-    if script_pubkey[0] != 0x76
-        || script_pubkey[1] != 0xa9
-        || script_pubkey[2] != 0x14
-        || script_pubkey[23] != 0x88
-        || script_pubkey[24] != 0xac
-    {
-        return None;
-    }
-
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&script_pubkey[3..23]);
-    Some(Address(addr))
+    Address::from_script_pubkey(script_pubkey)
 }
 
 /// Encrypted wallet file format.
@@ -616,14 +566,14 @@ mod tests {
     fn test_keypair_generation() {
         let keypair = Keypair::generate();
         let address = keypair.address();
-        assert_eq!(address.0.len(), 20);
+        assert_eq!(address.hash().len(), 20);
     }
 
     #[test]
     fn test_address_from_public_key() {
         let keypair = Keypair::generate();
         let pubkey = keypair.public_key();
-        let addr1 = Address::from_public_key(&pubkey);
+        let addr1 = Address::p2pkh_from_public_key(&pubkey);
         let addr2 = keypair.address();
         assert_eq!(addr1, addr2);
     }
@@ -633,7 +583,7 @@ mod tests {
         let keypair = Keypair::generate();
         let addr = keypair.address();
         let hex = addr.to_hex();
-        assert_eq!(hex.len(), 40); // 20 bytes = 40 hex chars
+        assert_eq!(hex.len(), 42); // 1 version byte + 20 hash bytes = 42 hex chars
         let parsed = Address::from_hex(&hex).unwrap();
         assert_eq!(addr, parsed);
     }

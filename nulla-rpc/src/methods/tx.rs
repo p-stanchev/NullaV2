@@ -32,6 +32,20 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
             return Err(RpcError::InvalidTransaction(format!("Input validation failed: {}", e)).into_error_object());
         }
 
+        // Calculate and validate transaction fee
+        let fee = ctx.db.calculate_tx_fee(&tx)
+            .map_err(|e| RpcError::InvalidTransaction(format!("Fee calculation failed: {}", e)).into_error_object())?;
+
+        // Check minimum fee requirement (spam prevention)
+        if fee < nulla_wallet::MIN_TX_FEE_ATOMS {
+            return Err(RpcError::InvalidTransaction(format!(
+                "Transaction fee ({} atoms) below minimum ({} atoms). Fee required: {} NULLA",
+                fee,
+                nulla_wallet::MIN_TX_FEE_ATOMS,
+                nulla_wallet::atoms_to_nulla(nulla_wallet::MIN_TX_FEE_ATOMS)
+            )).into_error_object());
+        }
+
         // Add to mempool
         ctx.db.put_mempool_tx(&tx)
             .map_err(|e| RpcError::Mempool(e.to_string()).into_error_object())?;

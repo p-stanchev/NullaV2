@@ -39,7 +39,8 @@ pub mod protocol {
     pub const MAX_HEADERS: usize = 2048;
 
     /// Maximum block size in bytes.
-    pub const MAX_BLOCK_SIZE: usize = 1_000_000;
+    /// Increased from 1 MB to 4 MB for 4x higher transaction capacity per block.
+    pub const MAX_BLOCK_SIZE: usize = 4_000_000;
 
     /// Maximum transaction size in bytes.
     pub const MAX_TX_SIZE: usize = 100_000;
@@ -164,6 +165,10 @@ pub mod dandelion {
         pub seen_ttl: Duration,
         /// Random number generator for probabilistic decisions.
         pub rng: rand::rngs::StdRng,
+        /// Minimum delay before broadcasting a transaction (milliseconds).
+        pub min_broadcast_delay_ms: u64,
+        /// Maximum delay before broadcasting a transaction (milliseconds).
+        pub max_broadcast_delay_ms: u64,
     }
 
     impl Dandelion {
@@ -180,14 +185,51 @@ pub mod dandelion {
                 seen: LruCache::new(NonZeroUsize::new(2048).unwrap()),
                 seen_ttl: Duration::from_secs(1800),
                 rng: rand::SeedableRng::from_seed(seed),
+                // Default: 100-500ms random delay before broadcasting
+                min_broadcast_delay_ms: 100,
+                max_broadcast_delay_ms: 500,
             }
         }
 
+        /// Generate a random broadcast delay to obfuscate transaction timing.
+        /// Returns a Duration between min_broadcast_delay_ms and max_broadcast_delay_ms.
+        pub fn random_broadcast_delay(&mut self) -> Duration {
+            let delay_ms = self.rng.gen_range(self.min_broadcast_delay_ms..=self.max_broadcast_delay_ms);
+            Duration::from_millis(delay_ms)
+        }
+
         /// Randomly select a new stem peer from the connected peers.
+        ///
+        /// Uses improved selection algorithm:
+        /// - Avoids immediately re-selecting the same peer
+        /// - Randomizes stem_timeout to prevent predictable rotation patterns
         pub fn rotate_peer(&mut self, peers: &[PeerId]) {
-            if let Some(peer) = peers.choose(&mut self.rng) {
+            if peers.is_empty() {
+                self.stem_peer = None;
+                return;
+            }
+
+            // Filter out current stem peer to ensure we rotate to a different peer
+            let candidates: Vec<_> = if let Some(current) = self.stem_peer {
+                peers.iter().filter(|&p| p != &current).copied().collect()
+            } else {
+                peers.to_vec()
+            };
+
+            // If filtering left us with no candidates, use all peers
+            let selection_pool = if candidates.is_empty() { peers } else { &candidates };
+
+            if let Some(peer) = selection_pool.choose(&mut self.rng) {
                 self.stem_peer = Some(*peer);
-                self.stem_deadline = Instant::now() + Duration::from_secs(600);
+
+                // Randomize stem rotation timeout between 8-12 seconds (avg 10s)
+                // This prevents timing correlation attacks
+                let base_timeout = self.stem_timeout.as_secs();
+                let jitter = self.rng.gen_range(0..=4) as i64 - 2; // -2 to +2 seconds
+                let timeout_secs = (base_timeout as i64 + jitter).max(5) as u64;
+
+                self.stem_deadline = Instant::now() + Duration::from_secs(timeout_secs);
+                tracing::debug!("rotated stem peer, next rotation in {}s", timeout_secs);
             }
         }
 
@@ -260,6 +302,14 @@ pub struct NetConfig {
     pub dandelion: bool,
     /// Enable cover traffic.
     pub cover_traffic: bool,
+    /// Number of stem hops in Dandelion++ before fluff phase.
+    pub dandelion_stem_hops: u8,
+    /// Probability of early fluff in Dandelion++ (0.0-1.0).
+    pub dandelion_fluff_probability: f32,
+    /// Minimum broadcast delay in milliseconds.
+    pub min_broadcast_delay_ms: u64,
+    /// Maximum broadcast delay in milliseconds.
+    pub max_broadcast_delay_ms: u64,
 }
 
 impl Default for NetConfig {
@@ -270,6 +320,10 @@ impl Default for NetConfig {
             peers: Vec::new(),
             dandelion: true,
             cover_traffic: false,
+            dandelion_stem_hops: 8,
+            dandelion_fluff_probability: 0.1,
+            min_broadcast_delay_ms: 100,
+            max_broadcast_delay_ms: 500,
         }
     }
 }
@@ -400,18 +454,35 @@ async fn run_swarm(
     chain_id: [u8; 4],
     cover_traffic: bool,
 ) {
-    // Cover traffic interval: send a noise message every 60 seconds.
-    let mut cover_traffic_interval = if cover_traffic {
-        Some(tokio::time::interval(Duration::from_secs(60)))
-    } else {
-        None
-    };
+    use rand::Rng;
 
     // Heartbeat interval: log connected peer count every 30 seconds.
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
     // Skip the immediate first tick
     heartbeat_interval.tick().await;
     tracing::debug!("heartbeat interval initialized, first tick in 30s");
+
+    // Cover traffic: randomized timing for better privacy
+    // Randomize between 30-90 seconds (avg 60s) to prevent timing analysis
+    let next_cover_traffic_delay = || -> Duration {
+        if cover_traffic {
+            let base_secs = 60;
+            let jitter_range = 30; // +/- 30 seconds
+            let jitter: i64 = rand::thread_rng().gen_range(-(jitter_range as i64)..=(jitter_range as i64));
+            Duration::from_secs((base_secs + jitter) as u64)
+        } else {
+            Duration::from_secs(u64::MAX) // Never fire if disabled
+        }
+    };
+
+    use tokio::pin;
+
+    let cover_traffic_sleep = if cover_traffic {
+        tokio::time::sleep(next_cover_traffic_delay())
+    } else {
+        tokio::time::sleep(Duration::from_secs(u64::MAX))
+    };
+    pin!(cover_traffic_sleep);
 
     loop {
         // Use biased select to prioritize timers over swarm events
@@ -424,16 +495,13 @@ async fn run_swarm(
                 info!("total peers connected: {}", connected_peers);
                 tracing::debug!("heartbeat fired, next in 30s");
             }
-            _ = async {
-                if let Some(ref mut interval) = cover_traffic_interval {
-                    interval.tick().await;
-                } else {
-                    // If cover traffic is disabled, never trigger this branch.
-                    std::future::pending::<()>().await
-                }
-            } => {
-                // Broadcast a cover traffic noise message.
+            _ = &mut cover_traffic_sleep, if cover_traffic => {
+                // Broadcast a cover traffic noise message with randomized timing.
+                let delay_secs = next_cover_traffic_delay().as_secs();
+                tracing::debug!("sending cover traffic, next in ~{} seconds", delay_secs);
                 gossip::send_cover_traffic(&mut swarm, chain_id);
+                // Reset timer with new random delay
+                cover_traffic_sleep.set(tokio::time::sleep(next_cover_traffic_delay()));
             }
             swarm_event = swarm.select_next_some() => {
                 if handle_swarm_event(&mut swarm, swarm_event, &evt_tx).await.is_err() {

@@ -19,3 +19,4 @@ thiserror.workspace = true
 bincode.workspace = true
 async-trait.workspace = true
 async-channel.workspace = true
+ed25519-dalek.workspace = true

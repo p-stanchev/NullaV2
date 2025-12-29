@@ -350,20 +350,126 @@ impl NullaDb {
         Ok(total_input)
     }
 
+    /// Calculate the transaction fee (inputs - outputs).
+    ///
+    /// For regular transactions: fee = sum(inputs) - sum(outputs)
+    /// For coinbase transactions: returns 0
+    ///
+    /// Returns Ok(fee) if the transaction is valid (inputs >= outputs).
+    /// Returns Err if outputs exceed inputs (invalid transaction).
+    pub fn calculate_tx_fee(&self, tx: &nulla_core::Tx) -> Result<u64> {
+        // Coinbase transactions have no fee
+        if nulla_core::is_coinbase(tx) {
+            return Ok(0);
+        }
+
+        // Calculate total input value
+        let total_input = self.validate_tx_inputs(tx)?;
+
+        // Calculate total output value
+        let mut total_output: u64 = 0;
+        for output in &tx.outputs {
+            total_output = total_output.checked_add(output.value_atoms).ok_or_else(|| {
+                DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
+                    "Output value overflow".to_string(),
+                )))
+            })?;
+        }
+
+        // Fee = inputs - outputs
+        // If outputs > inputs, this is an invalid transaction
+        if total_output > total_input {
+            return Err(DbError::Serde(bincode::Error::new(
+                bincode::ErrorKind::Custom(format!(
+                    "Outputs ({}) exceed inputs ({})",
+                    total_output, total_input
+                )),
+            )));
+        }
+
+        Ok(total_input - total_output)
+    }
+
+    /// Validate multiple transactions in parallel using rayon.
+    ///
+    /// This method validates transaction signatures and fees in parallel,
+    /// significantly speeding up block validation on multi-core systems.
+    ///
+    /// # Returns
+    /// - `Ok(total_fees)`: The sum of all transaction fees
+    /// - `Err(_)`: If any transaction fails validation
+    ///
+    /// # Performance
+    /// Expected 2-4x speedup on 4+ core CPUs compared to serial validation.
+    pub fn validate_block_txs_parallel(&self, txs: &[nulla_core::Tx]) -> Result<u64> {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Mutex;
+
+        let total_fees = AtomicU64::new(0);
+        let first_error: Mutex<Option<DbError>> = Mutex::new(None);
+
+        // Validate all transactions in parallel
+        txs.par_iter().for_each(|tx| {
+            // Skip if we already encountered an error
+            if first_error.lock().unwrap().is_some() {
+                return;
+            }
+
+            // Verify signatures
+            if let Err(e) = self.verify_tx_signatures(tx) {
+                *first_error.lock().unwrap() = Some(e);
+                return;
+            }
+
+            // Calculate and validate fee
+            match self.calculate_tx_fee(tx) {
+                Ok(fee) => {
+                    // Check minimum fee (10,000 atoms = 0.0001 NULLA)
+                    if !nulla_core::is_coinbase(tx) && fee < 10_000 {
+                        *first_error.lock().unwrap() = Some(DbError::Serde(
+                            bincode::Error::new(bincode::ErrorKind::Custom(
+                                format!("Transaction fee ({}) below minimum (10,000)", fee),
+                            )),
+                        ));
+                        return;
+                    }
+                    total_fees.fetch_add(fee, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    *first_error.lock().unwrap() = Some(e);
+                }
+            }
+        });
+
+        // Check if any errors occurred
+        if let Some(error) = first_error.into_inner().unwrap() {
+            return Err(error);
+        }
+
+        Ok(total_fees.load(Ordering::SeqCst))
+    }
+
     /// Verify Ed25519 signatures on all transaction inputs.
+    ///
+    /// Supports both P2PKH (single signature) and P2SH (multi-signature) transactions.
     ///
     /// For each input (except coinbase):
     /// 1. Looks up the previous output from UTXO set
-    /// 2. Extracts the address from the script_pubkey
-    /// 3. Hashes the public key from the input and verifies it matches the address
-    /// 4. Verifies the Ed25519 signature using the public key
+    /// 2. Determines script type (P2PKH or P2SH)
+    /// 3. Uses ScriptInterpreter to verify signatures
     ///
     /// Returns Ok(()) if all signatures are valid, Err otherwise.
     pub fn verify_tx_signatures(&self, tx: &nulla_core::Tx) -> Result<()> {
+        use nulla_core::{Script, ScriptInterpreter, ScriptType};
+
         // Skip coinbase transactions
         if nulla_core::is_coinbase(tx) {
             return Ok(());
         }
+
+        // Serialize transaction once for all signature verifications
+        let tx_data = bincode::serialize(tx)?;
 
         for input in &tx.inputs {
             // Get the previous output being spent
@@ -378,62 +484,103 @@ impl NullaDb {
                 }
             };
 
-            // Extract address from the previous output's script_pubkey
-            let expected_addr_bytes = match extract_address_bytes(&prev_output.script_pubkey) {
-                Some(addr) => addr,
-                None => {
-                    return Err(DbError::Serde(bincode::Error::new(
-                        bincode::ErrorKind::Custom("Invalid script_pubkey format".to_string()),
-                    )));
+            // Parse the script_pubkey to determine type
+            let script_pubkey = Script::new(prev_output.script_pubkey.clone());
+            let script_type = script_pubkey.script_type().ok_or_else(|| {
+                DbError::Serde(bincode::Error::new(
+                    bincode::ErrorKind::Custom("Unrecognized script type".to_string()),
+                ))
+            })?;
+
+            // Create script interpreter
+            let mut interpreter = ScriptInterpreter::new();
+
+            match script_type {
+                ScriptType::P2PKH => {
+                    // P2PKH: input has signature + pubkey
+                    if input.sig.len() != 64 {
+                        return Err(DbError::Serde(bincode::Error::new(
+                            bincode::ErrorKind::Custom("Invalid P2PKH signature length".to_string()),
+                        )));
+                    }
+
+                    if input.pubkey.len() != 32 {
+                        return Err(DbError::Serde(bincode::Error::new(
+                            bincode::ErrorKind::Custom("Invalid P2PKH pubkey length".to_string()),
+                        )));
+                    }
+
+                    // Verify P2PKH signature
+                    interpreter
+                        .verify_p2pkh(&input.sig, &input.pubkey, &script_pubkey, &tx_data)
+                        .map_err(|e| {
+                            DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
+                                format!("P2PKH verification failed: {}", e),
+                            )))
+                        })?;
                 }
-            };
 
-            // Parse public key from input (32 bytes for Ed25519)
-            if input.pubkey.len() != 32 {
-                return Err(DbError::Serde(bincode::Error::new(
-                    bincode::ErrorKind::Custom("Invalid public key length".to_string()),
-                )));
-            }
+                ScriptType::P2SH => {
+                    // P2SH: input.sig contains: num_sigs + signatures + redeem_script_len + redeem_script
+                    // input.pubkey is empty for P2SH
 
-            let pubkey_bytes: [u8; 32] = input.pubkey[..32].try_into().unwrap();
-            let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes) {
-                Ok(key) => key,
-                Err(_) => {
-                    return Err(DbError::Serde(bincode::Error::new(
-                        bincode::ErrorKind::Custom("Invalid Ed25519 public key".to_string()),
-                    )));
+                    if input.sig.is_empty() {
+                        return Err(DbError::Serde(bincode::Error::new(
+                            bincode::ErrorKind::Custom("Empty P2SH scriptSig".to_string()),
+                        )));
+                    }
+
+                    // Parse P2SH scriptSig format
+                    let mut pos = 0;
+
+                    // Read number of signatures (1 byte)
+                    if pos >= input.sig.len() {
+                        return Err(DbError::Serde(bincode::Error::new(
+                            bincode::ErrorKind::Custom("Invalid P2SH scriptSig: missing sig count".to_string()),
+                        )));
+                    }
+                    let num_sigs = input.sig[pos] as usize;
+                    pos += 1;
+
+                    // Read signatures (64 bytes each)
+                    let mut signatures = Vec::new();
+                    for _ in 0..num_sigs {
+                        if pos + 64 > input.sig.len() {
+                            return Err(DbError::Serde(bincode::Error::new(
+                                bincode::ErrorKind::Custom("Invalid P2SH scriptSig: incomplete signature".to_string()),
+                            )));
+                        }
+                        signatures.push(input.sig[pos..pos + 64].to_vec());
+                        pos += 64;
+                    }
+
+                    // Read redeem script length (2 bytes, little-endian)
+                    if pos + 2 > input.sig.len() {
+                        return Err(DbError::Serde(bincode::Error::new(
+                            bincode::ErrorKind::Custom("Invalid P2SH scriptSig: missing script length".to_string()),
+                        )));
+                    }
+                    let script_len = u16::from_le_bytes([input.sig[pos], input.sig[pos + 1]]) as usize;
+                    pos += 2;
+
+                    // Read redeem script
+                    if pos + script_len > input.sig.len() {
+                        return Err(DbError::Serde(bincode::Error::new(
+                            bincode::ErrorKind::Custom("Invalid P2SH scriptSig: incomplete redeem script".to_string()),
+                        )));
+                    }
+                    let redeem_script_bytes = input.sig[pos..pos + script_len].to_vec();
+                    let redeem_script = Script::new(redeem_script_bytes);
+
+                    // Verify P2SH signature
+                    interpreter
+                        .verify_p2sh(&signatures, &redeem_script, &script_pubkey, &tx_data)
+                        .map_err(|e| {
+                            DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
+                                format!("P2SH verification failed: {}", e),
+                            )))
+                        })?;
                 }
-            };
-
-            // Hash the public key to get the address
-            let pubkey_hash = blake3::hash(&input.pubkey);
-            let actual_addr_bytes = &pubkey_hash.as_bytes()[0..20];
-
-            // Verify the public key hashes to the expected address
-            if actual_addr_bytes != expected_addr_bytes.as_slice() {
-                return Err(DbError::Serde(bincode::Error::new(
-                    bincode::ErrorKind::Custom("Public key does not match address".to_string()),
-                )));
-            }
-
-            // Parse signature (64 bytes for Ed25519)
-            if input.sig.len() != 64 {
-                return Err(DbError::Serde(bincode::Error::new(
-                    bincode::ErrorKind::Custom("Invalid signature length".to_string()),
-                )));
-            }
-
-            let sig_bytes: [u8; 64] = input.sig[..64].try_into().unwrap();
-            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-            // Serialize transaction for verification
-            let tx_data = bincode::serialize(tx)?;
-
-            // Verify the signature
-            if verifying_key.verify_strict(&tx_data, &signature).is_err() {
-                return Err(DbError::Serde(bincode::Error::new(
-                    bincode::ErrorKind::Custom("Signature verification failed".to_string()),
-                )));
             }
         }
 

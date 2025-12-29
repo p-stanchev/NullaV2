@@ -16,7 +16,7 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
         let wallet_address = wallet.address();
 
         // Get balance
-        let utxos = ctx.db.get_utxos_by_address(&wallet_address.0)
+        let utxos = ctx.db.get_utxos_by_address(wallet_address.hash())
             .map_err(|e| RpcError::Database(e.to_string()).into_error_object())?;
 
         let balance: u64 = utxos.iter().map(|(_, txout)| txout.value_atoms).sum();

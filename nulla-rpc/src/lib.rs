@@ -69,6 +69,7 @@ pub async fn spawn_rpc_server(
     methods::tx::register_methods(&mut module)?;
     methods::wallet::register_methods(&mut module)?;
     methods::network::register_methods(&mut module)?;
+    methods::multisig::register_methods(&mut module)?;
 
     // Start the server
     let handle = server.start(module);

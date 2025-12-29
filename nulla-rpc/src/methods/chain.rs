@@ -76,7 +76,7 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
             .ok_or_else(|| RpcError::InvalidAddress("Invalid address hex".to_string()).into_error_object())?;
 
         // Get UTXOs for this address
-        let utxos = ctx.db.get_utxos_by_address(&addr.0)
+        let utxos = ctx.db.get_utxos_by_address(addr.hash())
             .map_err(|e| RpcError::Database(e.to_string()).into_error_object())?;
 
         let balance: u64 = utxos.iter().map(|(_, txout)| txout.value_atoms).sum();
