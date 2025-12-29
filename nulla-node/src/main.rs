@@ -638,7 +638,8 @@ async fn main() -> Result<()> {
     // Determine if Dandelion++ should be enabled (default true unless --no-dandelion is set).
     let dandelion_enabled = !args.no_dandelion && (args.dandelion || true);
 
-    if gossip_enabled {
+    // Store network command channel outside the if block for RPC access
+    let cmd_tx = if gossip_enabled {
         let net_cfg = NetConfig {
             chain_id,
             listen: listen_addrs,
@@ -685,13 +686,50 @@ async fn main() -> Result<()> {
                 shutdown.clone(),
             )?;
         }
+
+        cmd_tx
     } else {
         info!("gossip stack disabled; node running in local-only mode");
-    }
+        // Return a dummy channel when gossip is disabled
+        let (tx, _rx) = async_channel::bounded(100);
+        tx
+    };
+
+    // Start RPC server if RPC argument provided
+    let _rpc_handle = if !args.rpc.is_empty() {
+        let wallet_arc = wallet.as_ref()
+            .map(|w| Arc::new(tokio::sync::RwLock::new(w.clone())));
+
+        let rpc_ctx = nulla_rpc::RpcContext {
+            db: db.clone(),
+            network_tx: cmd_tx.clone(),
+            wallet: wallet_arc,
+            start_time: std::time::Instant::now(),
+        };
+
+        match nulla_rpc::spawn_rpc_server(args.rpc.clone(), rpc_ctx).await {
+            Ok(handle) => {
+                info!("RPC server started on {}", args.rpc);
+                Some(handle)
+            }
+            Err(e) => {
+                warn!("Failed to start RPC server: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Wait for Ctrl+C to shut down gracefully.
     signal::ctrl_c().await?;
     info!("shutting down");
+
+    // Stop RPC server if running
+    if let Some(handle) = _rpc_handle {
+        let _ = handle.stop();
+    }
+
     Ok(())
 }
 

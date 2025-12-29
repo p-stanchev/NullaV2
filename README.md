@@ -295,6 +295,101 @@ The node will log:
 - With `--miner-address`: `miner address loaded: 79bc6374ccc99f1211770ce007e05f6235b98c8b`
 - With `--wallet-seed`: `wallet loaded, address: 79bc6374ccc99f1211770ce007e05f6235b98c8b`
 
+### RPC/API Access
+
+Nulla provides a JSON-RPC 2.0 HTTP API for programmatic interaction with the blockchain node. The RPC server is Bitcoin/Ethereum compatible and enforces localhost-only binding for security.
+
+**Starting the RPC server:**
+```bash
+# Start node with RPC enabled on localhost:27447
+cargo run -p nulla-node -- --rpc 127.0.0.1:27447
+
+# With wallet access (enables wallet RPC methods)
+cargo run -p nulla-node -- --rpc 127.0.0.1:27447 --wallet-seed YOUR_SEED_HEX
+
+# Full-featured node with mining, seed mode, and RPC
+cargo run -p nulla-node -- --miner-address YOUR_ADDRESS --seed --rpc 127.0.0.1:27447
+```
+
+**Security:** The RPC server will only bind to localhost (127.0.0.1 or ::1). Attempts to bind to other addresses will fail with an error.
+
+**Available RPC Methods:**
+
+Chain Query Methods:
+- `getbestblockhash` - Returns the hash of the best (tip) block
+- `getblockcount` - Returns the current blockchain height
+- `getblockhash(height)` - Returns the block hash at a specific height
+- `getblockchaininfo` - Returns comprehensive blockchain information
+- `getbalance(address)` - Returns the balance for a given address
+
+Transaction Methods:
+- `sendrawtransaction(hex)` - Broadcasts a raw transaction to the network
+
+Wallet Methods (require `--wallet-seed`):
+- `getnewaddress` - Returns the wallet's address
+- `getwalletinfo` - Returns wallet information including balance and transaction count
+
+Network/Admin Methods:
+- `uptime` - Returns node uptime in seconds
+- `getpeerinfo` - Returns information about connected peers
+
+**Example RPC Calls:**
+
+```bash
+# Get the best block hash
+curl -X POST http://127.0.0.1:27447 \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"getbestblockhash","id":1}'
+
+# Get current block height
+curl -X POST http://127.0.0.1:27447 \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"getblockcount","id":1}'
+
+# Get blockchain info
+curl -X POST http://127.0.0.1:27447 \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"getblockchaininfo","id":1}'
+
+# Get balance for an address
+curl -X POST http://127.0.0.1:27447 \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"getbalance","params":["79bc6374ccc99f1211770ce007e05f6235b98c8b"],"id":1}'
+
+# Get wallet address (requires --wallet-seed)
+curl -X POST http://127.0.0.1:27447 \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"getnewaddress","id":1}'
+
+# Get node uptime
+curl -X POST http://127.0.0.1:27447 \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"uptime","id":1}'
+```
+
+**Response Format:**
+
+All responses follow JSON-RPC 2.0 standard:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": "...",
+  "id": 1
+}
+```
+
+Errors return:
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -5,
+    "message": "Wallet not loaded. Start node with --wallet flag."
+  },
+  "id": 1
+}
+```
+
 ### Running on a VPS
 
 To run a public seed node on a VPS that others can connect to:

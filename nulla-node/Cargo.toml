@@ -14,6 +14,7 @@ nulla-core = { path = "../nulla-core" }
 nulla-db = { path = "../nulla-db" }
 nulla-net = { path = "../nulla-net" }
 nulla-wallet = { path = "../nulla-wallet" }
+nulla-rpc = { path = "../nulla-rpc" }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
