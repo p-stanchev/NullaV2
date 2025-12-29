@@ -237,11 +237,13 @@ cargo run -p nulla-node -- --peers /ip4/YOUR_VPS_IP/tcp/27444
 - The node will log "listening on" and "peer connected" messages when successful
 - You can run multiple local nodes connecting to the same VPS seed node
 
-**Automatic Peer Discovery:**
-- When you connect to one peer, Kademlia DHT automatically discovers other peers in the network
-- Nodes exchange peer information automatically via the Identify protocol
-- You only need to specify one seed node with `--peers`, and you'll learn about all other connected nodes
-- The node logs "kad: discovered X peers" when it finds new peers through the DHT
+**Automatic Peer Discovery & Connection:**
+- When you connect to one peer, nodes **automatically dial each other** without manual configuration
+- The Identify protocol exchanges peer addresses automatically on connection
+- Discovered peers are **auto-dialed** if they have public IP addresses (private IPs are filtered)
+- Kademlia DHT builds a distributed routing table for peer discovery
+- You only need to specify one seed node with `--peers`, and your node will automatically connect to the entire network
+- Every **30 seconds**, nodes log: `total peers connected: X` for easy monitoring
 - This creates a self-healing mesh network where nodes can find each other automatically
 
 **Example with firewall (Ubuntu/Debian):**

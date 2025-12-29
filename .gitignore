@@ -23,6 +23,7 @@
 
 # Database and node data
 /data/
+/data1/
 /data2/
 **/data/
 *.db

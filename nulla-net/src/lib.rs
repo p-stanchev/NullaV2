@@ -13,8 +13,8 @@ use std::time::Duration;
 use async_channel::{Receiver, Sender};
 use futures::prelude::*;
 use libp2p::{
-    identify, noise, ping, request_response, swarm::SwarmEvent, tcp, Multiaddr, PeerId, Swarm,
-    SwarmBuilder,
+    identify, multiaddr::Protocol, noise, ping, request_response, swarm::SwarmEvent, tcp,
+    Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
 use thiserror::Error;
 use tokio::select;
@@ -374,6 +374,7 @@ pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError>
 
     let (cmd_tx, cmd_rx) = async_channel::bounded(64);
     let (evt_tx, evt_rx) = async_channel::bounded(1024);
+    info!("spawning network task with 30s heartbeat enabled");
     tokio::spawn(async move {
         run_swarm(swarm, cmd_rx, evt_tx, chain_id, cover_traffic).await;
     });
@@ -400,18 +401,22 @@ async fn run_swarm(
         None
     };
 
+    // Heartbeat interval: log connected peer count every 30 seconds.
+    let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
+    // Skip the immediate first tick
+    heartbeat_interval.tick().await;
+    tracing::debug!("heartbeat interval initialized, first tick in 30s");
+
     loop {
+        // Use biased select to prioritize timers over swarm events
         select! {
-            swarm_event = swarm.select_next_some() => {
-                if handle_swarm_event(&mut swarm, swarm_event, &evt_tx).await.is_err() {
-                    // Best-effort logging, do not crash the loop.
-                }
-            }
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Ok(command) => apply_command(&mut swarm, command, chain_id),
-                    Err(_) => break,
-                }
+            biased;
+
+            _ = heartbeat_interval.tick() => {
+                // Log heartbeat with connected peer count.
+                let connected_peers = swarm.connected_peers().count();
+                info!("total peers connected: {}", connected_peers);
+                tracing::debug!("heartbeat fired, next in 30s");
             }
             _ = async {
                 if let Some(ref mut interval) = cover_traffic_interval {
@@ -424,13 +429,70 @@ async fn run_swarm(
                 // Broadcast a cover traffic noise message.
                 gossip::send_cover_traffic(&mut swarm, chain_id);
             }
+            swarm_event = swarm.select_next_some() => {
+                if handle_swarm_event(&mut swarm, swarm_event, &evt_tx).await.is_err() {
+                    // Best-effort logging, do not crash the loop.
+                }
+            }
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Ok(command) => apply_command(&mut swarm, command, chain_id),
+                    Err(_) => break,
+                }
+            }
         }
     }
 }
 
+/// Check if a multiaddress contains a public (non-private) IP address.
+/// Returns false for localhost, private networks (10.x, 172.16-31.x, 192.168.x), and link-local addresses.
+fn is_public_addr(addr: &Multiaddr) -> bool {
+    for component in addr.iter() {
+        match component {
+            Protocol::Ip4(ip) => {
+                // Reject localhost
+                if ip.is_loopback() {
+                    return false;
+                }
+                // Reject private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+                if ip.is_private() {
+                    return false;
+                }
+                // Reject link-local (169.254.0.0/16)
+                if ip.octets()[0] == 169 && ip.octets()[1] == 254 {
+                    return false;
+                }
+                return true;
+            }
+            Protocol::Ip6(ip) => {
+                // Reject localhost (::1)
+                if ip.is_loopback() {
+                    return false;
+                }
+                // Reject unique local addresses (fc00::/7)
+                if (ip.segments()[0] & 0xfe00) == 0xfc00 {
+                    return false;
+                }
+                // Reject link-local addresses (fe80::/10)
+                if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+                    return false;
+                }
+                // Reject multicast addresses (ff00::/8)
+                if ip.is_multicast() {
+                    return false;
+                }
+                return true;
+            }
+            _ => continue,
+        }
+    }
+    // If no IP found, consider it non-public
+    false
+}
+
 /// Handle swarm events and emit network events.
 async fn handle_swarm_event(
-    _swarm: &mut Swarm<Behaviour>,
+    swarm: &mut Swarm<Behaviour>,
     event: SwarmEvent<behaviour::BehaviourEvent>,
     evt_tx: &Sender<NetworkEvent>,
 ) -> Result<(), NetError> {
@@ -500,8 +562,28 @@ async fn handle_swarm_event(
                         "identify: received from {peer_id}, listen addrs: {}",
                         info.listen_addrs.len()
                     );
-                    for addr in info.listen_addrs {
+                    for addr in &info.listen_addrs {
                         info!("identify: peer {peer_id} listening on {addr}");
+
+                        // Add address to Kademlia DHT for routing
+                        swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                    }
+
+                    // Automatically dial discovered peers if not already connected
+                    // Only dial public addresses to avoid connecting to private/internal IPs
+                    for addr in info.listen_addrs {
+                        if !is_public_addr(&addr) {
+                            tracing::debug!("identify: skipping private address {addr} for peer {peer_id}");
+                            continue;
+                        }
+
+                        let full_addr = addr.with(libp2p::multiaddr::Protocol::P2p(peer_id));
+                        if !swarm.is_connected(&peer_id) {
+                            info!("identify: auto-dialing discovered peer at {full_addr}");
+                            if let Err(err) = swarm.dial(full_addr.clone()) {
+                                tracing::warn!("identify: failed to auto-dial {full_addr}: {err:?}");
+                            }
+                        }
                     }
                 }
             }
