@@ -13,7 +13,7 @@
 
 Nulla is an experimental blockchain node implementation designed to explore privacy-enhancing network protocols and minimal consensus mechanisms. It features:
 
-- **Proof-of-Work Consensus**: Simple PoW with adjustable difficulty targets
+- **Proof-of-Work Consensus**: Bitcoin-style PoW with dynamic difficulty adjustment
 - **UTXO Model**: Bitcoin-style unspent transaction output tracking
 - **Privacy Features**: Dandelion++ transaction relay protocol for network-level anonymity
 - **P2P Networking**: libp2p-based networking with Noise encryption and Yamux multiplexing
@@ -36,6 +36,7 @@ The project is organized as a Rust workspace with four crates:
 - **BLAKE3 Hashing**: Fast cryptographic hashing for block and transaction IDs
 - **Merkle Trees**: Binary Merkle tree for transaction commitment
 - **Proof-of-Work**: Big-endian hash comparison against difficulty target
+- **Dynamic Difficulty Adjustment**: Adjusts every 10 blocks targeting 60-second block times
 - **UTXO Set**: Track spendable outputs and prevent double-spending
 
 ### Privacy
@@ -125,6 +126,7 @@ The stub miner broadcasts independent dummy blocks every 30 seconds. Unlike `--s
 
 #### Generate a New Wallet
 
+**Simple Wallet (Single Address):**
 ```bash
 cargo run -p nulla-node -- --generate-wallet
 ```
@@ -136,7 +138,96 @@ Address: 79bc6374ccc99f1211770ce007e05f6235b98c8b
 Seed:    a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094
 ```
 
+**HD Wallet (Multiple Addresses from One Seed) - RECOMMENDED:**
+```bash
+cargo run -p nulla-node -- --generate-hd-wallet
+```
+
+This outputs:
+```
+=== New HD Wallet Generated ===
+Master Seed: a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094
+
+First 5 Addresses:
+  [0] 79bc6374ccc99f1211770ce007e05f6235b98c8b
+  [1] 8a3d5e92f03ab1c7d9e6f7a4b8c2d1e0f9a7b3c6
+  [2] 1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c
+  [3] 2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d
+  [4] 3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e
+
+IMPORTANT: Save your MASTER SEED! This will not be shown again.
+```
+
+**Why use HD wallets?**
+- **Privacy**: Generate a new address for each transaction
+- **Convenience**: One master seed controls unlimited addresses
+- **Security**: Share addresses publicly while keeping the master seed private
+- **Compatibility**: Uses BIP44 standard (m/44'/0'/0'/0/index)
+
 **Save your seed securely!** You can restore your wallet using `--wallet-seed`.
+
+#### Create Encrypted Wallet File (RECOMMENDED)
+
+For better security and convenience, create an encrypted wallet file instead of managing seeds manually:
+
+```bash
+cargo run -p nulla-node -- --create-wallet wallet.dat --wallet-password "your-secure-password"
+```
+
+This outputs:
+```
+=== Encrypted Wallet Created ===
+File: wallet.dat
+
+First 5 Addresses:
+  [0] 79bc6374ccc99f1211770ce007e05f6235b98c8b
+  [1] 8a3d5e92f03ab1c7d9e6f7a4b8c2d1e0f9a7b3c6
+  [2] 1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c
+  [3] 2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d
+  [4] 3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e
+
+IMPORTANT: Remember your password! It cannot be recovered.
+IMPORTANT: Back up your wallet file: wallet.dat
+```
+
+**Using Your Encrypted Wallet:**
+
+```bash
+# Send transactions
+cargo run -p nulla-node -- --send --wallet-file wallet.dat --wallet-password "your-secure-password" --to <ADDRESS> --amount 5.0
+
+# Run a node with your wallet (for receiving mining rewards)
+cargo run -p nulla-node -- --wallet-file wallet.dat --wallet-password "your-secure-password"
+
+# Check your balance
+cargo run -p nulla-node -- --balance 79bc6374ccc99f1211770ce007e05f6235b98c8b
+```
+
+**Benefits:**
+- ✅ **No more copying/pasting seeds** - just remember your password
+- ✅ **HD wallet by default** - unlimited addresses from one file
+- ✅ **Encrypted at rest** - seed is protected with BLAKE3-based encryption
+- ✅ **Easy backups** - just copy wallet.dat to a safe location
+- ✅ **No plaintext exposure** - seed never appears in command history or logs
+
+#### Derive More Addresses from HD Wallet
+
+To generate additional addresses from your HD wallet master seed:
+```bash
+# Show first 10 addresses
+cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --derive-address 10
+```
+
+Output:
+```
+=== HD Wallet Addresses ===
+Derivation Path: m/44'/0'/0'/0/<index>
+
+  [0] 79bc6374ccc99f1211770ce007e05f6235b98c8b
+  [1] 8a3d5e92f03ab1c7d9e6f7a4b8c2d1e0f9a7b3c6
+  ...
+  [9] 4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f
+```
 
 #### Check Wallet Address
 
@@ -329,7 +420,12 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 
 ### Wallet
 
-- `--generate-wallet`: Generate a new wallet and print address and seed
+- `--generate-wallet`: Generate a new simple wallet (single address) and print address and seed
+- `--generate-hd-wallet`: Generate a new HD wallet (multiple addresses from one master seed)
+- `--create-wallet <FILE>`: Create a new encrypted HD wallet file (RECOMMENDED - requires `--wallet-password`)
+- `--wallet-file <FILE>`: Load wallet from encrypted file (requires `--wallet-password`)
+- `--wallet-password <PASSWORD>`: Password for wallet file encryption/decryption
+- `--derive-address <COUNT>`: Derive COUNT addresses from HD wallet master seed (requires `--wallet-seed`)
 - `--wallet-seed <HEX>`: Load wallet from 32-byte hex seed (use for transaction signing only, NOT for mining)
 - `--miner-address <HEX>`: Miner payout address for block rewards (40-char hex, 20 bytes) - SECURE for mining
 - `--get-address`: Display wallet address (requires `--wallet-seed`)
@@ -390,7 +486,9 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - [x] Block sync detection with progress bar UI
 - [x] Best tip tracking and automatic updates
 - [x] Wallet functionality (Ed25519 keypairs, address generation, transaction signing)
+- [x] HD (Hierarchical Deterministic) wallets with BIP44 derivation paths
 - [x] CLI commands for wallet generation and restoration
+- [x] Multiple address derivation from single master seed
 - [x] Chain selection based on cumulative work (Nakamoto consensus)
 - [x] Token economics (100M atoms per NULLA, 8 NULLA block reward)
 - [x] Wallet balance and address commands
@@ -413,6 +511,12 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - [x] Transaction inputs now include public keys for verification
 - [x] Blocks with invalid signatures are rejected
 - [x] Blocks attempting to spend non-existent UTXOs are rejected
+- [x] **Fork resolution and chain reorganization** 🔄
+- [x] **Automatic chain switching to highest cumulative work** 🔄
+- [x] **UTXO set rollback and reapplication during reorg** 🔄
+- [x] **Transaction broadcasting via --send command** 📡
+- [x] **Automatic peer mesh formation** 🌐
+- [x] **30-second connection heartbeat monitoring** 💓
 
 ### Launch Blockers 🚨 (Must Have for Production)
 - [x] **Wire up signature verification when processing blocks** ✅ DONE!
@@ -421,16 +525,18 @@ cargo run -p nulla-node -- --seed --wallet-seed YOUR_PRIVATE_KEY_HERE
 - [ ] **Difficulty adjustment algorithm** (required for real PoW security)
 
 ### Nice to Have (Can Launch Without)
-- [ ] Fork resolution and reorganization (helpers exist, needs wiring)
+- [x] **Fork resolution and reorganization** ✅ DONE!
+- [x] **Transaction mempool broadcasting** ✅ DONE! (--send command)
+- [x] **HD wallets (hierarchical derivation)** ✅ DONE!
+- [x] **Persistent wallet files** ✅ DONE! (encrypted wallet.dat files)
+- [x] **Wallet encryption** ✅ DONE! (BLAKE3-based password encryption)
 - [ ] Full script execution (simplified P2PKH works for now)
-- [ ] Persistent wallet files (current CLI approach works, but could be better)
-- [ ] Transaction mempool broadcasting (nodes can create txs locally)
-- [ ] Wallet encryption and key management improvements
 
 ### Future Improvements 💡
 
-**Persistent Wallet Proposal:**
-Current approach requires passing `--wallet-seed` or `--miner-address` on every invocation. A better UX would be:
+**Wallet Management (IMPLEMENTED):**
+~~Current approach requires passing `--wallet-seed` or `--miner-address` on every invocation. A better UX would be:~~
+✅ **NOW AVAILABLE:** Encrypted wallet files with `--create-wallet` and `--wallet-file`!
 
 ```bash
 # One-time wallet initialization (creates encrypted wallet.dat)
@@ -474,6 +580,14 @@ Nulla is an **educational** and **experimental** project focused on:
 **This is not production-ready software.** It's designed for learning, experimentation, and research.
 
 ## Technical Details
+
+### Consensus
+
+- **Proof-of-Work**: BLAKE3-based PoW with target-based difficulty
+- **Difficulty Adjustment**: Adjusts every 10 blocks to maintain 60-second block times
+- **Target Calculation**: Based on actual vs. expected time for previous interval
+- **Maximum Adjustment**: 4x per interval to prevent extreme difficulty swings
+- **Initial Target**: `0x000033ff...` (relatively easy for bootstrapping)
 
 ### Cryptography
 

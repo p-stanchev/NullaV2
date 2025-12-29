@@ -79,6 +79,8 @@ pub mod protocol {
         GetAddr,
         /// Dandelion++ stem-phase transaction relay.
         StemTx { txid: Hash32, hops_left: u8 },
+        /// Request mempool transactions (for initial sync).
+        GetMempool { limit: u32 },
     }
 
     /// Response messages.
@@ -100,6 +102,8 @@ pub mod protocol {
         PeerExchange { addrs: Vec<Vec<u8>> },
         /// List of known addresses.
         Addr { addrs: Vec<Vec<u8>> },
+        /// Mempool transactions.
+        Mempool { txs: Vec<Tx> },
         /// Error response.
         Err { code: u16 },
     }
@@ -317,6 +321,8 @@ pub enum NetworkEvent {
     PeerConnected(PeerId),
     /// A peer disconnected.
     PeerDisconnected(PeerId),
+    /// Broadcast failed due to no connected peers.
+    BroadcastFailed { reason: String },
 }
 
 /// Network errors.
@@ -436,7 +442,7 @@ async fn run_swarm(
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Ok(command) => apply_command(&mut swarm, command, chain_id),
+                    Ok(command) => apply_command(&mut swarm, command, chain_id, &evt_tx).await,
                     Err(_) => break,
                 }
             }
@@ -597,7 +603,12 @@ async fn handle_swarm_event(
 }
 
 /// Apply a network command to the swarm.
-fn apply_command(swarm: &mut Swarm<Behaviour>, command: NetworkCommand, chain_id: [u8; 4]) {
+async fn apply_command(
+    swarm: &mut Swarm<Behaviour>,
+    command: NetworkCommand,
+    chain_id: [u8; 4],
+    evt_tx: &async_channel::Sender<NetworkEvent>,
+) {
     match command {
         NetworkCommand::Dial(addr) => {
             if let Err(err) = Swarm::dial(swarm, addr.clone()) {
@@ -614,7 +625,13 @@ fn apply_command(swarm: &mut Swarm<Behaviour>, command: NetworkCommand, chain_id
             gossip::publish_block(swarm, header);
         }
         NetworkCommand::PublishFullBlock { block } => {
-            gossip::publish_full_block(swarm, block);
+            if !gossip::publish_full_block(swarm, block) {
+                let _ = evt_tx
+                    .send(NetworkEvent::BroadcastFailed {
+                        reason: "No peers connected to broadcast block".to_string(),
+                    })
+                    .await;
+            }
         }
         NetworkCommand::SendRequest { peer, req } => {
             swarm

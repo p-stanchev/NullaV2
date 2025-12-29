@@ -308,12 +308,72 @@ pub fn verify_tx_signatures(tx: &Tx) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Validate that a block's difficulty target is correct based on chain history.
+///
+/// This should be called when validating blocks received from the network.
+/// It checks that the block's target field matches the expected difficulty
+/// calculated from the timestamps and targets of previous blocks.
+///
+/// # Arguments
+/// * `block` - The block to validate
+/// * `get_header` - Function to retrieve historical block headers by height
+///
+/// # Returns
+/// Ok(()) if the difficulty target is correct, Err otherwise.
+pub fn validate_difficulty<F>(block: &Block, mut get_header: F) -> Result<(), ValidationError>
+where
+    F: FnMut(u64) -> Option<BlockHeader>,
+{
+    let current_height = block.header.height;
+
+    // Genesis block should use initial target
+    if current_height == 0 {
+        if block.header.target != INITIAL_TARGET {
+            return Err(ValidationError::InvalidPow);
+        }
+        return Ok(());
+    }
+
+    // Get previous block header
+    let prev_header = get_header(current_height - 1)
+        .ok_or(ValidationError::InvalidPow)?;
+
+    // If we're not at an adjustment boundary, target should match previous block
+    if current_height % difficulty::ADJUSTMENT_INTERVAL != 0 {
+        if block.header.target != prev_header.target {
+            return Err(ValidationError::InvalidPow);
+        }
+        return Ok(());
+    }
+
+    // At adjustment boundary, calculate expected target
+    let old_height = current_height.saturating_sub(difficulty::ADJUSTMENT_INTERVAL);
+    let old_header = get_header(old_height)
+        .ok_or(ValidationError::InvalidPow)?;
+
+    let expected_target = calculate_next_target(
+        current_height,
+        &prev_header.target,
+        prev_header.timestamp,
+        old_header.timestamp,
+    );
+
+    if block.header.target != expected_target {
+        return Err(ValidationError::InvalidPow);
+    }
+
+    Ok(())
+}
+
 /// Validate a complete block, checking:
 /// - The block contains at least one transaction
 /// - The first transaction is a valid coinbase
 /// - The merkle root matches the computed root of all transaction IDs
 /// - The proof-of-work is valid
 /// - Basic transaction structure for all transactions
+///
+/// Note: This does NOT validate difficulty adjustment. Use `validate_difficulty`
+/// separately when validating blocks from the network.
 pub fn validate_block(block: &Block) -> Result<(), ValidationError> {
     if block.txs.is_empty() {
         return Err(ValidationError::EmptyBlock);
@@ -340,6 +400,96 @@ pub fn validate_block(block: &Block) -> Result<(), ValidationError> {
     }
 
     validate_pow(&block.header)
+}
+
+/// Difficulty adjustment parameters.
+/// These values control how often difficulty adjusts and the target block time.
+pub mod difficulty {
+    /// Number of blocks between difficulty adjustments.
+    pub const ADJUSTMENT_INTERVAL: u64 = 10;
+
+    /// Target time per block in seconds.
+    pub const TARGET_BLOCK_TIME: u64 = 60;
+
+    /// Maximum difficulty adjustment factor (4x).
+    /// Prevents difficulty from changing too rapidly.
+    pub const MAX_ADJUSTMENT_FACTOR: u64 = 4;
+}
+
+/// Initial difficulty target for the genesis block.
+/// This is relatively easy to allow for bootstrapping the network.
+pub const INITIAL_TARGET: Hash32 = [
+    0x00, 0x00, 0x00, 0x33, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+];
+
+/// Calculate the next difficulty target based on the time it took to mine recent blocks.
+///
+/// This implements a Bitcoin-style difficulty adjustment algorithm:
+/// - Adjusts every `ADJUSTMENT_INTERVAL` blocks
+/// - Targets `TARGET_BLOCK_TIME` seconds per block
+/// - Limits adjustment to `MAX_ADJUSTMENT_FACTOR` to prevent extreme swings
+///
+/// # Arguments
+/// * `current_height` - Height of the block being mined
+/// * `current_target` - Current difficulty target
+/// * `prev_timestamp` - Timestamp of the previous block
+/// * `old_timestamp` - Timestamp of the block `ADJUSTMENT_INTERVAL` blocks ago
+///
+/// # Returns
+/// The new difficulty target for the next block.
+pub fn calculate_next_target(
+    current_height: u64,
+    current_target: &Hash32,
+    prev_timestamp: u64,
+    old_timestamp: u64,
+) -> Hash32 {
+    // Only adjust at interval boundaries
+    if current_height % difficulty::ADJUSTMENT_INTERVAL != 0 {
+        return *current_target;
+    }
+
+    // Calculate actual time taken for the last ADJUSTMENT_INTERVAL blocks
+    let actual_time = prev_timestamp.saturating_sub(old_timestamp);
+
+    // Calculate expected time
+    let expected_time = difficulty::ADJUSTMENT_INTERVAL * difficulty::TARGET_BLOCK_TIME;
+
+    // If we don't have valid timestamps, don't adjust
+    if actual_time == 0 {
+        return *current_target;
+    }
+
+    // Calculate adjustment ratio (with overflow protection)
+    // If blocks came too fast (actual < expected), difficulty should increase (target decrease)
+    // If blocks came too slow (actual > expected), difficulty should decrease (target increase)
+    let adjustment_num = actual_time.min(expected_time * difficulty::MAX_ADJUSTMENT_FACTOR);
+    let adjustment_denom = expected_time.max(actual_time / difficulty::MAX_ADJUSTMENT_FACTOR);
+
+    // Convert current target to u128 for math (use first 16 bytes)
+    let mut current_bytes = [0u8; 16];
+    current_bytes.copy_from_slice(&current_target[..16]);
+    let current_value = u128::from_be_bytes(current_bytes);
+
+    // Apply adjustment: new_target = current_target * (actual_time / expected_time)
+    // We use saturating math to prevent overflow
+    let adjusted_value = current_value
+        .saturating_mul(adjustment_num as u128)
+        .saturating_div(adjustment_denom as u128);
+
+    // Convert back to Hash32
+    let adjusted_bytes = adjusted_value.to_be_bytes();
+    let mut new_target = [0xffu8; 32];
+    new_target[..16].copy_from_slice(&adjusted_bytes);
+
+    // Ensure target doesn't exceed maximum (minimum difficulty)
+    if !leq_be(&new_target, &INITIAL_TARGET) {
+        return INITIAL_TARGET;
+    }
+
+    new_target
 }
 
 /// Compare two 256-bit hashes as big-endian integers.

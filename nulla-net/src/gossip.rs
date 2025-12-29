@@ -37,13 +37,21 @@ pub fn publish_block(swarm: &mut Swarm<Behaviour>, header: BlockHeader) {
 }
 
 /// Publish a full block to the network (includes all transactions).
-pub fn publish_full_block(swarm: &mut Swarm<Behaviour>, block: Block) {
+/// Returns true if the block was published successfully, false otherwise.
+pub fn publish_full_block(swarm: &mut Swarm<Behaviour>, block: Block) -> bool {
+    let peer_count = swarm.connected_peers().count();
+    if peer_count == 0 {
+        return false;
+    }
+
     let msg = protocol::GossipMsg::FullBlock {
         block: block.clone(),
     };
     if let Ok(data) = postcard::to_allocvec(&msg) {
         let topic = gossipsub::IdentTopic::new(protocol::topic_inv_block(&block.header.chain_id));
-        let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
+        swarm.behaviour_mut().gossipsub.publish(topic, data).is_ok()
+    } else {
+        false
     }
 }
 

@@ -86,6 +86,18 @@ struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     generate_wallet: bool,
 
+    /// Generate a new HD (Hierarchical Deterministic) wallet.
+    /// Allows deriving multiple addresses from a single master seed.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    generate_hd_wallet: bool,
+
+    /// Derive addresses from HD wallet master seed.
+    /// Format: --derive-address <count>
+    /// Example: --derive-address 5 (shows first 5 addresses)
+    /// Requires: --wallet-seed (master seed)
+    #[arg(long)]
+    derive_address: Option<u32>,
+
     /// Wallet seed (32 bytes hex) to use for signing transactions.
     /// WARNING: Only use for transaction signing, NOT for mining!
     /// For mining, use --miner-address instead to avoid exposing your private key.
@@ -111,6 +123,22 @@ struct Args {
     /// Example: --send --to 79bc6374ccc99f1211770ce007e05f6235b98c8b --amount 5.0
     #[arg(long, action = clap::ArgAction::SetTrue)]
     send: bool,
+
+    /// Create a new encrypted wallet file.
+    /// Creates a new HD wallet and saves it to the specified file with password encryption.
+    /// Example: --create-wallet wallet.dat
+    #[arg(long)]
+    create_wallet: Option<String>,
+
+    /// Load wallet from an encrypted file.
+    /// Example: --wallet-file wallet.dat
+    #[arg(long)]
+    wallet_file: Option<String>,
+
+    /// Password for wallet file encryption/decryption.
+    /// Use with --create-wallet or --wallet-file.
+    #[arg(long)]
+    wallet_password: Option<String>,
 
     /// Recipient address for sending NULLA (40-char hex, 20 bytes).
     #[arg(long)]
@@ -140,6 +168,94 @@ async fn main() -> Result<()> {
         println!("\nTo check balance:");
         println!("  --balance {}\n", wallet.address());
         return Ok(());
+    }
+
+    // Handle HD wallet generation command.
+    if args.generate_hd_wallet {
+        let mut master_seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut master_seed);
+        let wallet = Wallet::from_master_seed(&master_seed).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let seed_hex = hex::encode(master_seed);
+
+        println!("\n=== New HD Wallet Generated ===");
+        println!("Master Seed: {}", seed_hex);
+        println!("\nFirst 5 Addresses:");
+        for i in 0..5 {
+            let addr = wallet.derive_address(i).map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("  [{}] {}", i, addr);
+        }
+        println!("\nIMPORTANT: Save your MASTER SEED! This will not be shown again.");
+        println!("IMPORTANT: Anyone with this seed can spend funds from ALL derived addresses.");
+        println!("\nTo derive more addresses:");
+        println!("  --wallet-seed {} --derive-address 10", seed_hex);
+        println!("\nTo check balance of any address:");
+        println!("  --balance <ADDRESS>\n");
+        return Ok(());
+    }
+
+    // Handle create wallet file command.
+    if let Some(wallet_path) = &args.create_wallet {
+        let password = args.wallet_password.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Error: --wallet-password required for --create-wallet")
+        })?;
+
+        if Wallet::exists(wallet_path) {
+            eprintln!("Error: Wallet file already exists at {}", wallet_path);
+            eprintln!("Choose a different filename or delete the existing file.");
+            std::process::exit(1);
+        }
+
+        // Generate new HD wallet
+        let mut master_seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut master_seed);
+        let wallet = Wallet::from_master_seed(&master_seed).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Save to encrypted file
+        wallet.save_to_file(wallet_path, password).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        println!("\n=== Encrypted Wallet Created ===");
+        println!("File: {}", wallet_path);
+        println!("\nFirst 5 Addresses:");
+        for i in 0..5 {
+            let addr = wallet.derive_address(i).map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("  [{}] {}", i, addr);
+        }
+        println!("\nIMPORTANT: Remember your password! It cannot be recovered.");
+        println!("IMPORTANT: Back up your wallet file: {}", wallet_path);
+        println!("\nTo use this wallet:");
+        println!("  --wallet-file {} --wallet-password <PASSWORD>", wallet_path);
+        println!("\nTo check balance:");
+        println!("  --balance {}\n", wallet.address());
+        return Ok(());
+    }
+
+    // Handle derive address command.
+    if let Some(count) = args.derive_address {
+        if let Some(seed_hex) = &args.wallet_seed {
+            match hex::decode(seed_hex) {
+                Ok(seed_bytes) if seed_bytes.len() == 32 => {
+                    let mut master_seed = [0u8; 32];
+                    master_seed.copy_from_slice(&seed_bytes);
+                    let wallet = Wallet::from_master_seed(&master_seed).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                    println!("\n=== HD Wallet Addresses ===");
+                    println!("Derivation Path: m/44'/0'/0'/0/<index>\n");
+                    for i in 0..count {
+                        let addr = wallet.derive_address(i).map_err(|e| anyhow::anyhow!("{}", e))?;
+                        println!("  [{}] {}", i, addr);
+                    }
+                    println!();
+                    return Ok(());
+                }
+                _ => {
+                    eprintln!("Error: Invalid master seed (must be 32 bytes hex)");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            eprintln!("Error: --wallet-seed (master seed) required for --derive-address");
+            std::process::exit(1);
+        }
     }
 
     // Handle get address command.
@@ -242,13 +358,6 @@ async fn main() -> Result<()> {
     // Handle send transaction command.
     if args.send {
         // Validate required arguments.
-        let wallet_seed = match &args.wallet_seed {
-            Some(s) => s,
-            None => {
-                eprintln!("Error: --wallet-seed required for --send");
-                std::process::exit(1);
-            }
-        };
         let to_addr = match &args.to {
             Some(s) => s,
             None => {
@@ -264,17 +373,33 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Parse wallet seed.
-        let seed_bytes = match hex::decode(wallet_seed) {
-            Ok(bytes) if bytes.len() == 32 => bytes,
-            _ => {
-                eprintln!("Error: Invalid wallet seed (must be 32 bytes hex)");
-                std::process::exit(1);
+        // Load wallet from file or seed.
+        let wallet = if let Some(wallet_path) = &args.wallet_file {
+            let password = args.wallet_password.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Error: --wallet-password required with --wallet-file")
+            })?;
+            match Wallet::load_from_file(wallet_path, password) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Error loading wallet file: {}", e);
+                    std::process::exit(1);
+                }
             }
+        } else if let Some(wallet_seed) = &args.wallet_seed {
+            let seed_bytes = match hex::decode(wallet_seed) {
+                Ok(bytes) if bytes.len() == 32 => bytes,
+                _ => {
+                    eprintln!("Error: Invalid wallet seed (must be 32 bytes hex)");
+                    std::process::exit(1);
+                }
+            };
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&seed_bytes);
+            Wallet::from_seed(&seed)
+        } else {
+            eprintln!("Error: --wallet-seed or --wallet-file required for --send");
+            std::process::exit(1);
         };
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&seed_bytes);
-        let wallet = Wallet::from_seed(&seed);
 
         // Parse recipient address.
         let recipient = match nulla_wallet::Address::from_hex(to_addr) {
@@ -436,14 +561,33 @@ async fn main() -> Result<()> {
 
     info!("starting nulla-node chain_id={:?}", args.chain_id);
 
-    // Load wallet if seed is provided.
-    let wallet = if let Some(seed_hex) = &args.wallet_seed {
+    // Load wallet from either seed or encrypted file.
+    let wallet = if let Some(wallet_path) = &args.wallet_file {
+        // Load from encrypted wallet file
+        let password = args.wallet_password.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Error: --wallet-password required with --wallet-file")
+        })?;
+
+        match Wallet::load_from_file(wallet_path, password) {
+            Ok(wallet) => {
+                info!("wallet loaded from file: {}", wallet_path);
+                info!("wallet address: {}", wallet.address());
+                Some(wallet)
+            }
+            Err(e) => {
+                eprintln!("Error loading wallet file: {}", e);
+                eprintln!("Make sure the password is correct and the file exists.");
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(seed_hex) = &args.wallet_seed {
+        // Load from hex seed
         match hex::decode(seed_hex) {
             Ok(seed_bytes) if seed_bytes.len() == 32 => {
                 let mut seed = [0u8; 32];
                 seed.copy_from_slice(&seed_bytes);
                 let wallet = Wallet::from_seed(&seed);
-                info!("wallet loaded, address: {}", wallet.address());
+                info!("wallet loaded from seed, address: {}", wallet.address());
                 Some(wallet)
             }
             _ => {
@@ -766,6 +910,40 @@ async fn handle_network_events(
             }
             NetworkEvent::Response { peer, resp } => {
                 info!("response from {peer:?}: {:?}", resp);
+
+                // Handle mempool sync for all nodes (not just seed mode)
+                if let protocol::Resp::Mempool { txs } = &resp {
+                    info!("received {} mempool transactions from {peer}", txs.len());
+                    for tx in txs {
+                        // Validate transaction before adding to mempool
+                        match db.validate_tx_inputs(tx) {
+                            Ok(total_input) => {
+                                if let Err(e) = db.verify_tx_signatures(tx) {
+                                    warn!("invalid signature in mempool tx: {}", e);
+                                    continue;
+                                }
+
+                                let total_output: u64 = tx.outputs.iter().map(|o| o.value_atoms).sum();
+                                if total_output > total_input {
+                                    warn!("mempool tx outputs exceed inputs");
+                                    continue;
+                                }
+
+                                // Add to local mempool
+                                let txid = nulla_core::tx_id(tx);
+                                if let Err(e) = db.put_mempool_tx(tx) {
+                                    warn!("failed to add mempool tx {}: {}", hex::encode(txid), e);
+                                } else {
+                                    info!("added mempool tx {} from peer", hex::encode(txid));
+                                }
+                            }
+                            Err(e) => {
+                                warn!("invalid UTXO in mempool tx: {}", e);
+                            }
+                        }
+                    }
+                }
+
                 if seed_mode {
                     match resp {
                         protocol::Resp::Tip {
@@ -818,6 +996,15 @@ async fn handle_network_events(
             NetworkEvent::NewListen(addr) => info!("listening on {addr}"),
             NetworkEvent::PeerConnected(peer) => {
                 info!("peer connected {peer}");
+
+                // Request mempool synchronization from the newly connected peer
+                let _ = cmd_tx
+                    .send(NetworkCommand::SendRequest {
+                        peer,
+                        req: protocol::Req::GetMempool { limit: 100 },
+                    })
+                    .await;
+
                 if seed_mode {
                     let _ = cmd_tx
                         .send(NetworkCommand::SendRequest {
@@ -828,8 +1015,109 @@ async fn handle_network_events(
                 }
             }
             NetworkEvent::PeerDisconnected(peer) => info!("peer disconnected {peer}"),
+            NetworkEvent::BroadcastFailed { reason } => {
+                warn!("broadcast failed: {}", reason);
+            }
         }
     }
+}
+
+/// Perform a chain reorganization from old_tip to new_tip.
+///
+/// This function:
+/// 1. Finds the common ancestor between old and new chains
+/// 2. Reverts blocks from old chain back to the common ancestor
+/// 3. Applies blocks from the common ancestor to the new tip
+async fn perform_reorg(
+    db: &NullaDb,
+    old_tip: [u8; 32],
+    new_tip: [u8; 32],
+) -> anyhow::Result<()> {
+    info!("starting chain reorganization");
+    info!("  old tip: {}", hex::encode(old_tip));
+    info!("  new tip: {}", hex::encode(new_tip));
+
+    // Step 1: Build paths from both tips back to genesis
+    let mut old_path = vec![old_tip];
+    let mut new_path = vec![new_tip];
+
+    // Build old chain path
+    let mut current = old_tip;
+    while current != [0u8; 32] {
+        if let Some(block) = db.get_block(&current)? {
+            current = block.header.prev;
+            old_path.push(current);
+        } else {
+            break;
+        }
+    }
+
+    // Build new chain path
+    current = new_tip;
+    while current != [0u8; 32] {
+        if let Some(block) = db.get_block(&current)? {
+            current = block.header.prev;
+            new_path.push(current);
+        } else {
+            break;
+        }
+    }
+
+    // Step 2: Find common ancestor
+    let mut common_ancestor = None;
+    for old_block in &old_path {
+        if new_path.contains(old_block) {
+            common_ancestor = Some(*old_block);
+            break;
+        }
+    }
+
+    let common_ancestor = common_ancestor.ok_or_else(|| anyhow::anyhow!("no common ancestor found"))?;
+    info!("  common ancestor: {}", hex::encode(common_ancestor));
+
+    // Step 3: Revert blocks from old chain
+    let blocks_to_revert: Vec<[u8; 32]> = old_path
+        .iter()
+        .take_while(|&&id| id != common_ancestor)
+        .copied()
+        .collect();
+
+    info!("  reverting {} blocks from old chain", blocks_to_revert.len());
+    for block_id in blocks_to_revert {
+        if let Some(block) = db.get_block(&block_id)? {
+            // Revert transactions in reverse order (except coinbase)
+            for tx in block.txs.iter().skip(1).rev() {
+                if let Err(e) = db.revert_tx(tx) {
+                    warn!("failed to revert tx during reorg: {}", e);
+                }
+            }
+            info!("    reverted block at height {}", block.header.height);
+        }
+    }
+
+    // Step 4: Apply blocks from new chain
+    let blocks_to_apply: Vec<[u8; 32]> = new_path
+        .iter()
+        .take_while(|&&id| id != common_ancestor)
+        .copied()
+        .collect();
+
+    info!("  applying {} blocks from new chain", blocks_to_apply.len());
+    // Apply in reverse order (from common ancestor to new tip)
+    for block_id in blocks_to_apply.iter().rev() {
+        if let Some(block) = db.get_block(block_id)? {
+            // Apply transactions (skip coinbase)
+            for tx in block.txs.iter().skip(1) {
+                if let Err(e) = db.apply_tx(tx) {
+                    warn!("failed to apply tx during reorg: {}", e);
+                }
+            }
+            info!("    applied block at height {}", block.header.height);
+        }
+    }
+
+    info!("chain reorganization complete");
+    Ok(())
 }
 
 async fn process_full_block(
@@ -857,6 +1145,15 @@ async fn process_full_block(
 
     if let Err(e) = nulla_core::validate_block(&block) {
         warn!("received invalid block (structure): {e}");
+        return;
+    }
+
+    // Validate difficulty target is correct
+    let get_header = |height: u64| -> Option<nulla_core::BlockHeader> {
+        db.get_header_by_height(height).ok().flatten()
+    };
+    if let Err(e) = nulla_core::validate_difficulty(&block, get_header) {
+        warn!("received block with invalid difficulty target: {e}");
         return;
     }
 
@@ -940,11 +1237,20 @@ async fn process_full_block(
                     "received chain with more work (our: {}, theirs: {}), height: {}",
                     tip_work, cumulative_work, block.header.height
                 );
+
+                // Perform chain reorganization
+                info!("triggering chain reorganization");
+                if let Err(e) = perform_reorg(db, tip_id, block_id).await {
+                    warn!("reorganization failed: {}", e);
+                    return;
+                }
+
+                // Update best tip after successful reorg
                 if let Err(e) = db.set_best_tip(&block_id, block.header.height, cumulative_work) {
-                    warn!("failed to update best tip: {e}");
+                    warn!("failed to update best tip after reorg: {e}");
                 } else {
                     info!(
-                        "switched to new best chain at height {}",
+                        "switched to new best chain at height {} after reorg",
                         block.header.height
                     );
                 }
@@ -1057,6 +1363,21 @@ fn handle_request(db: &NullaDb, req: protocol::Req) -> protocol::Resp {
             // Dandelion++ stem relay (handled elsewhere, return error here).
             warn!("stem tx {} hops_left {}", hex::encode(txid), hops_left);
             protocol::Resp::Err { code: 400 }
+        }
+        protocol::Req::GetMempool { limit } => {
+            // Return mempool transactions up to the specified limit.
+            match db.get_mempool_txs() {
+                Ok(all_txs) => {
+                    let max_txs = limit.min(100) as usize; // Cap at 100 transactions
+                    let txs = all_txs.into_iter().take(max_txs).collect();
+                    info!("returning {} mempool transactions", max_txs.min(db.mempool_size()));
+                    protocol::Resp::Mempool { txs }
+                }
+                Err(e) => {
+                    warn!("failed to get mempool txs: {}", e);
+                    protocol::Resp::Err { code: 500 }
+                }
+            }
         }
     }
 }
@@ -1249,12 +1570,51 @@ fn spawn_miner_real(
             let txids: Vec<Hash32> = txs.iter().map(nulla_core::tx_id).collect();
             let merkle_root = nulla_core::merkle_root(&txids);
 
-            // Set mining difficulty target (requires multiple leading zero bits)
-            let mut target = [0xffu8; 32];
-            target[0] = 0x00; // First byte must be 0x00
-            target[1] = 0x00; // Second byte must be 0x00
-            target[2] = 0x00; // Third byte must be 0x00
-            target[3] = 0x33; // Fourth byte capped (~5x harder than 24-bit)
+            // Calculate difficulty target based on chain history
+            let target = if next_height == 0 {
+                // Genesis block uses initial target
+                nulla_core::INITIAL_TARGET
+            } else if next_height % nulla_core::difficulty::ADJUSTMENT_INTERVAL != 0 {
+                // Not at adjustment boundary, use previous block's target
+                match db.get_header(&prev_id) {
+                    Ok(Some(prev_header)) => prev_header.target,
+                    _ => {
+                        warn!("miner: failed to get previous header for target, using initial target");
+                        nulla_core::INITIAL_TARGET
+                    }
+                }
+            } else {
+                // At adjustment boundary, calculate new target
+                let Some(prev_header) = db.get_header(&prev_id).ok().flatten() else {
+                    warn!("miner: failed to get previous header, using initial target");
+                    continue;
+                };
+
+                let old_height = next_height.saturating_sub(nulla_core::difficulty::ADJUSTMENT_INTERVAL);
+                let old_header = match db.get_header_by_height(old_height) {
+                    Ok(Some(h)) => h,
+                    _ => {
+                        warn!("miner: failed to get old header for difficulty adjustment, using previous target");
+                        continue;
+                    }
+                };
+
+                let new_target = nulla_core::calculate_next_target(
+                    next_height,
+                    &prev_header.target,
+                    prev_header.timestamp,
+                    old_header.timestamp,
+                );
+
+                info!(
+                    "miner: difficulty adjustment at height {} (prev_target: {:02x}{:02x}{:02x}{:02x}, new_target: {:02x}{:02x}{:02x}{:02x})",
+                    next_height,
+                    prev_header.target[0], prev_header.target[1], prev_header.target[2], prev_header.target[3],
+                    new_target[0], new_target[1], new_target[2], new_target[3]
+                );
+
+                new_target
+            };
 
             // Mine for a valid nonce using all available CPU threads
             // Use all available threads, with a sensible minimum so even small systems
