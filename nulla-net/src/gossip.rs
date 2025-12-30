@@ -52,8 +52,8 @@ pub fn publish_full_block(swarm: &mut Swarm<Behaviour>, block: Block) -> bool {
         let topic = gossipsub::IdentTopic::new(protocol::topic_inv_block(&block.header.chain_id));
         let result = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data);
         match &result {
-            Ok(_) => tracing::info!("published block {} to gossipsub topic {} ({} peers)",
-                hex::encode(nulla_core::block_id(&block)), topic, peer_count),
+            Ok(_) => tracing::info!("published block height={} to gossipsub topic {} ({} peers)",
+                block.header.height, topic, peer_count),
             Err(e) => tracing::warn!("failed to publish block to gossipsub: {:?}", e),
         }
         result.is_ok()
