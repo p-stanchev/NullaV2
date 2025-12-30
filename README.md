@@ -133,9 +133,9 @@ cargo run -p nulla-node -- --listen /ip4/0.0.0.0/tcp/27444 --mine
 
 The stub miner broadcasts independent dummy blocks every 30 seconds. Unlike `--seed`, these blocks do NOT build on each other (all at height 0).
 
-### Wallet Operations
+## Wallet and Mining Setup
 
-#### Token Economics
+### Token Economics
 
 - **1 NULLA** = 100,000,000 atoms (8 decimal places, like Bitcoin satoshis)
 - **Block Reward**: 8 NULLA (800,000,000 atoms) per block
@@ -144,26 +144,38 @@ The stub miner broadcasts independent dummy blocks every 30 seconds. Unlike `--s
   - Fees are collected by miners in the coinbase transaction
   - Transactions with insufficient fees are rejected by the network
 
-#### Generate a New Wallet
+### Quick Start: Wallet Setup
 
-**Simple Wallet (Single Address):**
+#### Option 1: Simple Wallet (Single Address)
+
 ```bash
-cargo run -p nulla-node -- --generate-wallet
+# Generate a new wallet
+nulla --generate-wallet
 ```
 
-This outputs:
+Output:
 ```
 === New Wallet Generated ===
 Address: 79bc6374ccc99f1211770ce007e05f6235b98c8b
 Seed:    a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094
+
+⚠️  IMPORTANT: Save your seed securely! You'll need it to access your funds.
 ```
 
-**HD Wallet (Multiple Addresses from One Seed) - RECOMMENDED:**
+**Save the seed** to a file manually:
 ```bash
-cargo run -p nulla-node -- --generate-hd-wallet
+echo "a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094" > wallet.seed
+chmod 600 wallet.seed  # Linux/macOS: Restrict permissions
 ```
 
-This outputs:
+#### Option 2: HD Wallet (Multiple Addresses) - RECOMMENDED
+
+```bash
+# Generate an HD wallet with multiple addresses
+nulla --generate-hd-wallet
+```
+
+Output:
 ```
 === New HD Wallet Generated ===
 Master Seed: a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094
@@ -174,146 +186,169 @@ First 5 Addresses:
   [2] 1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c
   [3] 2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d
   [4] 3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e
-
-IMPORTANT: Save your MASTER SEED! This will not be shown again.
 ```
 
 **Why use HD wallets?**
-- **Privacy**: Generate a new address for each transaction
-- **Convenience**: One master seed controls unlimited addresses
-- **Security**: Share addresses publicly while keeping the master seed private
-- **Compatibility**: Uses BIP44 standard (m/44'/0'/0'/0/index)
+- Generate unlimited addresses from one master seed
+- Better privacy (new address per transaction)
+- Uses BIP44 standard (m/44'/0'/0'/0/index)
 
-**Save your seed securely!** You can restore your wallet using `--wallet-seed`.
+**Save the master seed** securely:
+```bash
+echo "a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094" > wallet.seed
+chmod 600 wallet.seed  # Linux/macOS only
+```
 
-#### Create Encrypted Wallet File (RECOMMENDED)
-
-For better security and convenience, create an encrypted wallet file instead of managing seeds manually:
+#### Option 3: Encrypted Wallet File (MOST SECURE)
 
 ```bash
-cargo run -p nulla-node -- --create-wallet wallet.dat --wallet-password "your-secure-password"
+# Create an encrypted wallet file (best practice)
+nulla --create-wallet wallet.dat --wallet-password "YourSecurePassword123"
 ```
 
-This outputs:
-```
-=== Encrypted Wallet Created ===
-File: wallet.dat
+Benefits:
+- ✅ **Encrypted at rest** with password protection
+- ✅ **HD wallet by default** (unlimited addresses)
+- ✅ **No plaintext seeds** in command history
+- ✅ **Easy backups** (just copy wallet.dat)
 
-First 5 Addresses:
-  [0] 79bc6374ccc99f1211770ce007e05f6235b98c8b
-  [1] 8a3d5e92f03ab1c7d9e6f7a4b8c2d1e0f9a7b3c6
-  [2] 1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c
-  [3] 2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d
-  [4] 3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e
+### Wallet Operations
 
-IMPORTANT: Remember your password! It cannot be recovered.
-IMPORTANT: Back up your wallet file: wallet.dat
-```
-
-**Using Your Encrypted Wallet:**
+#### Get Your Wallet Address
 
 ```bash
-# Send transactions
-cargo run -p nulla-node -- --send --wallet-file wallet.dat --wallet-password "your-secure-password" --to <ADDRESS> --amount 5.0
+# From wallet file
+nulla --wallet-file wallet.seed --get-address
 
-# Run a node with your wallet (for receiving mining rewards)
-cargo run -p nulla-node -- --wallet-file wallet.dat --wallet-password "your-secure-password"
-
-# Check your balance
-cargo run -p nulla-node -- --balance 79bc6374ccc99f1211770ce007e05f6235b98c8b
+# Or specify index for HD wallets
+nulla --wallet-file wallet.seed --derive-address 1
 ```
 
-**Benefits:**
-- ✅ **No more copying/pasting seeds** - just remember your password
-- ✅ **HD wallet by default** - unlimited addresses from one file
-- ✅ **Encrypted at rest** - seed is protected with BLAKE3-based encryption
-- ✅ **Easy backups** - just copy wallet.dat to a safe location
-- ✅ **No plaintext exposure** - seed never appears in command history or logs
+#### Check Balance
 
-#### Derive More Addresses from HD Wallet
-
-To generate additional addresses from your HD wallet master seed:
 ```bash
-# Show first 10 addresses
-cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --derive-address 10
+# Check specific address balance
+nulla --get-balance --address 79bc6374ccc99f1211770ce007e05f6235b98c8b
+
+# Or check your wallet's default address
+nulla --wallet-file wallet.seed --get-balance
 ```
 
-Output:
-```
-=== HD Wallet Addresses ===
-Derivation Path: m/44'/0'/0'/0/<index>
+#### Derive Multiple Addresses (HD Wallets)
 
-  [0] 79bc6374ccc99f1211770ce007e05f6235b98c8b
-  [1] 8a3d5e92f03ab1c7d9e6f7a4b8c2d1e0f9a7b3c6
-  ...
-  [9] 4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f
-```
-
-#### Check Wallet Address
-
-Display the address for a given wallet seed:
 ```bash
-cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --get-address
+# Show first 10 addresses from your HD wallet
+nulla --wallet-file wallet.seed --derive-address 10
 ```
 
-Output:
-```
-=== Wallet Address ===
-79bc6374ccc99f1211770ce007e05f6235b98c8b
-```
+### Mining Setup
 
-#### Check Address Balance
+Mining creates new blocks and earns block rewards. You need a wallet address to receive rewards.
 
-**NEW - Recommended method (works with any address):**
+#### Single Machine Setup (Development/Testing)
+
 ```bash
-# Check your own balance (no private key needed!)
-cargo run -p nulla-node -- --balance 79bc6374ccc99f1211770ce007e05f6235b98c8b
+# Step 1: Generate wallet and get address
+nulla --generate-hd-wallet
+# Copy the first address (e.g., 79bc6374ccc99f1211770ce007e05f6235b98c8b)
 
-# Check someone else's balance (blockchain is public!)
-cargo run -p nulla-node -- --balance THEIR_ADDRESS_HERE
+# Step 2: Save the master seed
+echo "YOUR_MASTER_SEED_HERE" > wallet.seed
+
+# Step 3: Start mining with your address
+nulla --mine --miner-address 79bc6374ccc99f1211770ce007e05f6235b98c8b --seed
 ```
 
-Output:
-```
-=== Address Balance ===
-Address: 79bc6374ccc99f1211770ce007e05f6235b98c8b
-Balance: 16.00000000 NULLA (1600000000 atoms)
-UTXOs:   2
+**Parameters:**
+- `--mine`: Enable proof-of-work mining
+- `--miner-address`: Your address that receives block rewards (public address, safe to expose)
+- `--seed`: Enable seed mode (proper blockchain building)
 
-UTXO Details:
-  a1b2c3d4e5f6g7h8 vout:0 = 800000000 atoms
-  9f8e7d6c5b4a3210 vout:0 = 800000000 atoms
-```
+**Note:** You don't need `--wallet-file` for mining! The miner address is public. You only need the wallet file later when you want to **spend** your rewards.
 
-**Old method (DEPRECATED - requires private key):**
+#### Production Setup (VPS + Local Node)
+
+**On VPS (Linux - Seed + Miner):**
+
 ```bash
-cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --get-balance --db ./data
+# Step 1: Build the release binary
+cargo clean
+cargo build --release
+
+# Step 2: Generate wallet
+./target/release/nulla --generate-hd-wallet
+# Copy the first address and save the master seed securely!
+
+# Step 3: Save wallet seed for later (to spend rewards)
+echo "YOUR_MASTER_SEED" > wallet.seed
+chmod 600 wallet.seed
+
+# Step 4: Run seed + miner (wallet file NOT needed for mining)
+./target/release/nulla \
+  --seed \
+  --mine \
+  --miner-address YOUR_ADDRESS_HERE \
+  --listen /ip4/0.0.0.0/tcp/27444 \
+  --gossip
 ```
 
-**Why use `--balance` instead of `--get-balance`:**
-- ✅ No private key needed (read-only operation)
-- ✅ Works with any address (check others' balances too)
-- ✅ Simpler - just provide the address
-- ✅ Safe - can't accidentally expose wallet seed
+**On Local Machine (Windows/Mac - Regular Node):**
 
-#### Using a Wallet with a Running Node
-
-**For Mining (Recommended - Secure):**
 ```bash
-# Use --miner-address to receive block rewards WITHOUT exposing your private key
-cargo run -p nulla-node -- --seed --miner-address 79bc6374ccc99f1211770ce007e05f6235b98c8b --listen /ip4/0.0.0.0/tcp/27444
+# Step 1: Rebuild to match VPS version
+cargo clean
+cargo build --release
+
+# Step 2: Connect to VPS (no mining)
+./target/release/nulla \
+  --peers /ip4/YOUR_VPS_IP/tcp/27444 \
+  --rpc 127.0.0.1:27447 \
+  --gossip
 ```
 
-**For Transaction Signing (Use with Caution):**
+**Important Notes:**
+- ✅ Only run mining on ONE machine (typically VPS) to avoid chain splits
+- ✅ Rebuild both machines with same code version to ensure compatibility
+- ✅ VPS should use `--seed --mine` together for proper blockchain
+- ✅ Local machine should NOT use `--mine` (just syncs blocks)
+- ✅ Use `--miner-address` instead of `--wallet-seed` (more secure)
+
+#### Advanced: Encrypted Wallet for Mining
+
 ```bash
-# WARNING: This exposes your private key in process lists!
-# Only use --wallet-seed when you need to sign transactions, NOT for mining
-cargo run -p nulla-node -- --wallet-seed a57ae4a1591694799b7cee1af130dc9486f380a105ca6fe648d850904283f094 --listen /ip4/0.0.0.0/tcp/27444
+# Step 1: Create encrypted wallet
+nulla --create-wallet wallet.dat --wallet-password "SecurePass123"
+
+# Step 2: Mine with encrypted wallet
+nulla --mine --seed \
+  --wallet-file wallet.dat \
+  --wallet-password "SecurePass123" \
+  --miner-address YOUR_ADDRESS
 ```
 
-The node will log:
-- With `--miner-address`: `miner address loaded: 79bc6374ccc99f1211770ce007e05f6235b98c8b`
-- With `--wallet-seed`: `wallet loaded, address: 79bc6374ccc99f1211770ce007e05f6235b98c8b`
+### Sending Transactions
+
+To send NULLA to another address, you need your wallet file:
+
+```bash
+# Send 5.0 NULLA to recipient address
+nulla --send \
+  --wallet-file wallet.seed \
+  --to RECIPIENT_ADDRESS_HERE \
+  --amount 5.0
+
+# Or with encrypted wallet
+nulla --send \
+  --wallet-file wallet.dat \
+  --wallet-password "YourPassword" \
+  --to RECIPIENT_ADDRESS_HERE \
+  --amount 5.0
+```
+
+**Transaction Details:**
+- Minimum fee: 0.0001 NULLA (10,000 atoms)
+- Fee is automatically deducted from your balance
+- Transactions require at least 1 confirmation to be considered final
 
 ### RPC/API Access
 

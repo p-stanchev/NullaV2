@@ -937,6 +937,9 @@ async fn handle_network_events(
     // This prevents adding conflicting transactions to the mempool
     let mut mempool_spent: HashSet<OutPoint> = HashSet::new();
 
+    // Track connected peers to avoid duplicate connection log messages
+    let mut connected_peers: HashSet<libp2p::PeerId> = HashSet::new();
+
     while let Ok(evt) = rx.recv().await {
         match evt {
             NetworkEvent::TxInv { from, txid } => {
@@ -1179,7 +1182,12 @@ async fn handle_network_events(
 
                 // Handle mempool sync for all nodes (not just seed mode)
                 if let protocol::Resp::Mempool { txs } = &resp {
-                    info!("received {} mempool transactions from {peer}", txs.len());
+                    // Only log if we actually received transactions
+                    if !txs.is_empty() {
+                        info!("received {} mempool transactions from {peer}", txs.len());
+                    } else {
+                        debug!("received 0 mempool transactions from {peer}");
+                    }
                     for tx in txs {
                         // SECURITY: Check for double-spend in mempool before adding
                         let mut has_double_spend = false;
@@ -1282,26 +1290,34 @@ async fn handle_network_events(
             }
             NetworkEvent::NewListen(addr) => info!("listening on {addr}"),
             NetworkEvent::PeerConnected(peer) => {
-                info!("peer connected {peer}");
+                // Only log first connection to avoid duplicate messages
+                if connected_peers.insert(peer) {
+                    info!("peer connected {peer}");
 
-                // Request mempool synchronization from the newly connected peer
-                let _ = cmd_tx
-                    .send(NetworkCommand::SendRequest {
-                        peer,
-                        req: protocol::Req::GetMempool { limit: 100 },
-                    })
-                    .await;
-
-                if seed_mode {
+                    // Request mempool synchronization from the newly connected peer
                     let _ = cmd_tx
                         .send(NetworkCommand::SendRequest {
                             peer,
-                            req: protocol::Req::GetTip,
+                            req: protocol::Req::GetMempool { limit: 100 },
                         })
                         .await;
+
+                    if seed_mode {
+                        let _ = cmd_tx
+                            .send(NetworkCommand::SendRequest {
+                                peer,
+                                req: protocol::Req::GetTip,
+                            })
+                            .await;
+                    }
                 }
             }
-            NetworkEvent::PeerDisconnected(peer) => info!("peer disconnected {peer}"),
+            NetworkEvent::PeerDisconnected(peer) => {
+                // Remove from tracking and log disconnection
+                if connected_peers.remove(&peer) {
+                    info!("peer disconnected {peer}");
+                }
+            }
             NetworkEvent::BroadcastFailed { reason } => {
                 warn!("broadcast failed: {}", reason);
             }
