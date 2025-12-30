@@ -101,6 +101,8 @@ pub async fn spawn_rpc_server(
     }
 
     // Build the server with security limits (SECURITY FIX: HIGH-NEW-003)
+    // NOTE: CORS cannot be easily added to jsonrpsee 0.22 - users must use browser extensions
+    // or run wallet GUI with --disable-web-security flag for development
     let server = ServerBuilder::default()
         .max_connections(MAX_CONNECTIONS)
         .max_request_body_size(MAX_REQUEST_SIZE)

@@ -10,7 +10,7 @@ use nulla_electrum::ElectrumServer;
 /// allowing lightweight clients to operate without downloading full blockchain.
 pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()> {
     // Get block headers in range (for header-only sync)
-    module.register_async_method("blockchain.headers.subscribe", |params, ctx| async move {
+    module.register_async_method("blockchain.headers.subscribe", |_params, ctx| async move {
         ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
 
         let electrum = ElectrumServer::new(ctx.db.clone(), ctx.chain_id);
@@ -67,6 +67,21 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
         }).collect();
 
         Ok::<Vec<nulla_electrum::UnspentItem>, jsonrpsee::types::ErrorObjectOwned>(items)
+    })?;
+
+    // Get transaction history for an address
+    module.register_async_method("blockchain.scripthash.get_history", |params, ctx| async move {
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
+        let address_hex: String = params.one()?;
+        let address = nulla_wallet::Address::from_hex(&address_hex)
+            .ok_or_else(|| RpcError::InvalidAddress("Invalid address hex".to_string()).into_error_object())?;
+
+        let electrum = ElectrumServer::new(ctx.db.clone(), ctx.chain_id);
+        let history = electrum.get_history(address.hash())
+            .map_err(|e| RpcError::Internal(e.to_string()).into_error_object())?;
+
+        Ok::<Vec<nulla_electrum::HistoryItem>, jsonrpsee::types::ErrorObjectOwned>(history)
     })?;
 
     // Broadcast a transaction

@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nulla Wallet - Light Client</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 32px;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+
+        .status {
+            display: flex;
+            justify-content: space-around;
+            padding: 20px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        .status-item {
+            text-align: center;
+        }
+
+        .status-label {
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .status-value {
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-top: 5px;
+        }
+
+        .content {
+            padding: 30px;
+        }
+
+        .section {
+            margin-bottom: 30px;
+        }
+
+        .section h2 {
+            font-size: 20px;
+            margin-bottom: 15px;
+            color: #333;
+        }
+
+        .input-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 5px;
+            color: #555;
+        }
+
+        input, textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: monospace;
+            transition: border-color 0.3s;
+        }
+
+        input:focus, textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .balance-display {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 12px;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .balance-label {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        .balance-amount {
+            font-size: 48px;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+
+        .balance-usd {
+            font-size: 16px;
+            opacity: 0.8;
+        }
+
+        .utxo-list {
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 10px;
+        }
+
+        .utxo-item {
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            margin-bottom: 8px;
+            font-size: 12px;
+            font-family: monospace;
+        }
+
+        .utxo-item strong {
+            color: #667eea;
+        }
+
+        .error {
+            background: #ff4444;
+            color: white;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+
+        .success {
+            background: #00C851;
+            color: white;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+
+        .address-display {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            word-break: break-all;
+            font-family: monospace;
+            font-size: 14px;
+            margin-bottom: 15px;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 10px;
+        }
+
+        .button-group button {
+            flex: 1;
+        }
+
+        .info-box {
+            background: #e3f2fd;
+            border-left: 4px solid #2196F3;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+
+        .info-box p {
+            margin: 5px 0;
+            font-size: 14px;
+            color: #1976D2;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="../assets/nulla.svg" alt="Nulla" style="height: 64px; margin-bottom: 15px;">
+            <h1>Nulla Wallet</h1>
+            <p>Lightweight SPV Client - No Full Blockchain Download Required</p>
+        </div>
+
+        <div class="status">
+            <div class="status-item">
+                <div class="status-label">Connection</div>
+                <div class="status-value" id="connectionStatus">Disconnected</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Block Height</div>
+                <div class="status-value" id="blockHeight">-</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Sync Status</div>
+                <div class="status-value" id="syncStatus">Not Synced</div>
+            </div>
+        </div>
+
+        <div class="content">
+            <div class="info-box">
+                <p><strong>Important:</strong> This is a demo light wallet using the Electrum protocol.</p>
+                <p>Make sure your Nulla node is running with RPC enabled on localhost:27447</p>
+            </div>
+
+            <!-- Wallet Setup -->
+            <div class="section">
+                <h2>Wallet Setup</h2>
+                <div class="input-group">
+                    <label for="addressInput">Your Nulla Address</label>
+                    <input type="text" id="addressInput" placeholder="Enter your address (40-char hex)" />
+                </div>
+                <button onclick="loadWallet()">Load Wallet</button>
+            </div>
+
+            <!-- Balance Display -->
+            <div class="section" id="balanceSection" style="display: none;">
+                <h2>Balance</h2>
+                <div class="balance-display">
+                    <div class="balance-label">Total Balance</div>
+                    <div class="balance-amount" id="balanceAmount">0.00000000</div>
+                    <div class="balance-usd">NULLA</div>
+                </div>
+
+                <h3>Unspent Outputs (UTXOs)</h3>
+                <div class="utxo-list" id="utxoList">
+                    <p style="text-align: center; color: #999;">No UTXOs found</p>
+                </div>
+            </div>
+
+            <!-- Send Transaction -->
+            <div class="section" id="sendSection" style="display: none;">
+                <h2>Send Transaction</h2>
+                <div class="input-group">
+                    <label for="recipientInput">Recipient Address</label>
+                    <input type="text" id="recipientInput" placeholder="Recipient address (40-char hex)" />
+                </div>
+                <div class="input-group">
+                    <label for="amountInput">Amount (NULLA)</label>
+                    <input type="number" id="amountInput" step="0.00000001" placeholder="0.00000000" />
+                </div>
+                <div class="input-group">
+                    <label for="txHexInput">Signed Transaction (Hex)</label>
+                    <textarea id="txHexInput" placeholder="Build and sign transaction offline, then paste hex here"></textarea>
+                </div>
+                <button onclick="broadcastTransaction()">Broadcast Transaction</button>
+            </div>
+
+            <div id="messageDiv"></div>
+        </div>
+    </div>
+
+    <script src="wallet.js"></script>
+</body>
+</html>

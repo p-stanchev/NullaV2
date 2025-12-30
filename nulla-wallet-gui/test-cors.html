@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CORS Test</title>
+</head>
+<body>
+    <h1>CORS Test</h1>
+    <button onclick="testRPC()">Test RPC Connection</button>
+    <pre id="output"></pre>
+
+    <script>
+        async function testRPC() {
+            const output = document.getElementById('output');
+            output.textContent = 'Testing...\n';
+
+            // Log current URL
+            output.textContent += 'Current URL: ' + window.location.href + '\n';
+            output.textContent += 'Protocol: ' + window.location.protocol + '\n\n';
+
+            try {
+                const response = await fetch('http://localhost:27447', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        jsonrpc: '2.0',
+                        id: 1,
+                        method: 'blockchain.headers.subscribe',
+                        params: []
+                    })
+                });
+
+                output.textContent += 'Response status: ' + response.status + '\n';
+                const data = await response.json();
+                output.textContent += 'Response: ' + JSON.stringify(data, null, 2) + '\n';
+                output.textContent += '\n✅ SUCCESS! CORS is working!\n';
+            } catch (error) {
+                output.textContent += '❌ ERROR: ' + error.message + '\n';
+                output.textContent += '\nIf you see "Failed to fetch", this means:\n';
+                output.textContent += '1. You\'re accessing via file:// protocol, OR\n';
+                output.textContent += '2. CORS is not enabled on the web server, OR\n';
+                output.textContent += '3. The RPC server is not running\n';
+            }
+        }
+    </script>
+</body>
+</html>

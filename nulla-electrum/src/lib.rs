@@ -121,6 +121,31 @@ impl ElectrumServer {
         Ok(None)
     }
 
+    /// Get transaction history for an address.
+    /// Returns a list of transaction IDs and their heights.
+    ///
+    /// Note: This is a simplified implementation that scans UTXOs.
+    /// A production implementation would maintain a tx_history index.
+    pub fn get_history(&self, address: &[u8; 20]) -> Result<Vec<HistoryItem>> {
+        let mut history = Vec::new();
+
+        // Get all UTXOs for this address
+        let utxos = self.db.get_utxos_by_address(address)?;
+
+        // For each UTXO, we know the txid but not the height
+        // Without a tx index, we can't efficiently determine heights
+        // For MVP, return transactions with height=0 (unconfirmed)
+        for (outpoint, _txout) in utxos {
+            history.push(HistoryItem {
+                txid: hex::encode(outpoint.txid),
+                height: 0, // TODO: Would need tx -> block height index
+                fee: None,
+            });
+        }
+
+        Ok(history)
+    }
+
     /// Generate merkle proof for a transaction in a block.
     /// Returns the merkle branch and position of the transaction.
     pub fn get_merkle_proof(&self, txid: &Hash32, block_id: &Hash32) -> Result<MerkleProof> {

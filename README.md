@@ -419,6 +419,7 @@ cargo clean
 cargo build --release
 
 # Connect to VPS and sync (NO mining on local machine!)
+# IMPORTANT: Use 127.0.0.1 (not localhost) for --rpc
 .\target\release\nulla.exe --peers /ip4/YOUR_VPS_IP/tcp/27444 --rpc 127.0.0.1:27447 --gossip
 ```
 
@@ -454,6 +455,7 @@ INFO sync tick: height=150 tip=a1b2c3d4 work=5000000 mempool=0
 - ⚠️  **Only VPS should mine** (use `--mine` only, NOT `--seed`)
 - ⚠️  **Local machine should NOT mine** (only syncs blocks)
 - ⚠️  **Both must run same code version** (rebuild both after any updates)
+- ⚠️  **Use IP format for RPC**: `--rpc 127.0.0.1:27447` NOT `--rpc localhost:27447`
 - ✅  VPS needs `--listen` to accept connections
 - ✅  Local needs `--peers` with VPS IP address
 - ✅  Use `--miner-address` (public) NOT `--wallet-seed` (private)
@@ -559,9 +561,67 @@ nulla --send \
 - Fee is automatically deducted from your balance
 - Transactions require at least 1 confirmation to be considered final
 
+### GUI Wallet
+
+Nulla includes a lightweight web-based wallet GUI that uses the Electrum protocol for SPV (Simplified Payment Verification). The wallet doesn't require downloading the full blockchain.
+
+**Location**: [nulla-wallet-gui/](nulla-wallet-gui/)
+
+**Features**:
+- ✅ Light client (no full blockchain download)
+- ✅ Balance checking and UTXO management
+- ✅ Transaction broadcasting
+- ✅ SPV verification with merkle proofs
+- ✅ Header-only sync
+
+**Quick Start**:
+
+**Terminal 1 - Start Nulla Node**:
+```bash
+cd c:\Users\stanc\Desktop\Nulla
+cargo run --release --bin nulla -- --rpc 127.0.0.1:27447 --mine --miner-address YOUR_ADDRESS
+```
+
+**Terminal 2 - Start Wallet Server**:
+```bash
+cd c:\Users\stanc\Desktop\Nulla\nulla-wallet-gui
+serve.bat  # Windows
+# or
+./serve.sh  # Linux/macOS
+```
+
+**Browser**:
+Open: **http://localhost:8080**
+
+**IMPORTANT**:
+1. Use `--rpc 127.0.0.1:27447` (not `localhost:27447`)
+2. Serve wallet via HTTP (not `file://`)
+3. May require CORS workaround - see [nulla-wallet-gui/CORS_WORKAROUND.md](nulla-wallet-gui/CORS_WORKAROUND.md)
+
+For complete documentation, see [nulla-wallet-gui/README.md](nulla-wallet-gui/README.md).
+
 ### RPC/API Access
 
 Nulla provides a JSON-RPC 2.0 HTTP API for programmatic interaction with the blockchain node. The RPC server is Bitcoin/Ethereum compatible and enforces localhost-only binding for security.
+
+**IMPORTANT: RPC Bind Address Format**
+
+The RPC server MUST use IP address format, NOT hostname format:
+
+✅ **CORRECT**:
+```bash
+--rpc 127.0.0.1:27447
+```
+
+❌ **WRONG** (will fail):
+```bash
+--rpc localhost:27447
+```
+
+Using `localhost` will cause the error:
+```
+WARN Failed to start RPC server: Invalid bind address 'localhost:27447': invalid socket address syntax
+```
 
 **Starting the RPC server:**
 ```bash

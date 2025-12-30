@@ -1113,6 +1113,9 @@ async fn handle_network_events(
                     hex::encode(block_id)
                 );
 
+                // Clone header for potential re-broadcast
+                let header_clone = header.clone();
+
                 // Store the header in the database.
                 if let Err(e) = db.put_header(&header) {
                     warn!("failed to store header: {e}");
@@ -1218,9 +1221,22 @@ async fn handle_network_events(
                         warn!("failed to get best tip: {e}");
                     }
                 }
+
+                // Re-broadcast header to gossip network (relay to other peers)
+                let _ = cmd_tx
+                    .send(nulla_net::NetworkCommand::PublishBlock { header: header_clone })
+                    .await;
             }
             NetworkEvent::FullBlock { from, block } => {
-                process_full_block(&db, &sync_progress, block, Some(from), &chain_id).await;
+                let block_clone = block.clone();
+                let is_valid = process_full_block(&db, &sync_progress, block, Some(from), &chain_id).await;
+
+                // Re-broadcast valid blocks to gossip network (relay to other peers)
+                if is_valid {
+                    let _ = cmd_tx
+                        .send(nulla_net::NetworkCommand::PublishFullBlock { block: block_clone })
+                        .await;
+                }
             }
             NetworkEvent::Request { peer, req, channel } => {
                 // Only log GetHeaders and GetBlock requests at debug level to reduce clutter during sync
@@ -1520,7 +1536,7 @@ async fn process_full_block(
     block: nulla_core::Block,
     from: Option<libp2p::PeerId>,
     chain_id: &[u8; 4],
-) {
+) -> bool {
     let block_id = nulla_core::block_id(&block);
     if let Some(peer) = from {
         info!(
@@ -1540,7 +1556,7 @@ async fn process_full_block(
 
     if let Err(e) = nulla_core::validate_block(&block) {
         warn!("received invalid block (structure): {e}");
-        return;
+        return false;
     }
 
     // Validate difficulty target is correct
@@ -1549,7 +1565,7 @@ async fn process_full_block(
     };
     if let Err(e) = nulla_core::validate_difficulty(&block, get_header) {
         warn!("received block with invalid difficulty target: {e}");
-        return;
+        return false;
     }
 
     // Validate block timestamp (SECURITY FIX: HIGH-NEW-001)
@@ -1559,13 +1575,13 @@ async fn process_full_block(
         .as_secs();
     if let Err(e) = nulla_core::validate_block_timestamp(&block, get_header, current_time) {
         warn!("received block with invalid timestamp: {e}");
-        return;
+        return false;
     }
 
     // Validate checkpoint (SECURITY FIX: HIGH-012)
     if let Err(e) = nulla_core::validate_checkpoint(block.header.height, &block_id) {
         warn!("received block failed checkpoint validation: {e}");
-        return;
+        return false;
     }
 
     // Validate and apply all transactions atomically (SECURITY FIX: CRIT-NEW-003)
@@ -1575,7 +1591,7 @@ async fn process_full_block(
         Ok(fees) => fees,
         Err(e) => {
             warn!("block rejected: atomic validation failed: {e}");
-            return;
+            return false;
         }
     };
 
@@ -1592,12 +1608,12 @@ async fn process_full_block(
             "block rejected: coinbase validation failed (height: {}, reward: {}, fees: {}, error: {})",
             block.header.height, block_reward, total_fees, e
         );
-        return;
+        return false;
     }
 
     if let Err(e) = db.put_block_full(&block) {
         warn!("failed to store full block: {e}");
-        return;
+        return false;
     }
 
     let block_work = nulla_core::target_work(&block.header.target);
@@ -1657,7 +1673,7 @@ async fn process_full_block(
                 info!("triggering chain reorganization");
                 if let Err(e) = perform_reorg(db, tip_id, block_id).await {
                     warn!("reorganization failed: {}", e);
-                    return;
+                    return false;
                 }
 
                 // Update best tip after successful reorg
@@ -1714,6 +1730,9 @@ async fn process_full_block(
             warn!("failed to get best tip: {e}");
         }
     }
+
+    // Block was successfully validated and stored
+    true
 }
 
 /// Handle an incoming request and generate a response.

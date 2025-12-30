@@ -1087,4 +1087,9 @@ impl NullaDb {
 
         Ok(result)
     }
+
+    /// Get block header by block ID.
+    pub fn get_header_by_id(&self, block_id: &Hash32) -> Result<Option<BlockHeader>> {
+        self.get_header(block_id)
+    }
 }
