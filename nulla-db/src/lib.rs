@@ -80,6 +80,11 @@ pub struct NullaDb {
     work: Tree,
     /// UTXO index by address (maps address bytes -> Vec<OutPoint>).
     utxo_by_addr: Tree,
+    /// Coinbase metadata (maps OutPoint -> block height for coinbase outputs).
+    coinbase_heights: Tree,
+    /// Spent UTXO backup for reorg restoration (maps OutPoint -> TxOut).
+    /// Stores the original UTXO data when an output is spent, allowing proper restoration during chain reorgs.
+    spent_utxos: Tree,
 }
 
 impl NullaDb {
@@ -96,6 +101,8 @@ impl NullaDb {
             spent: db.open_tree("spent")?,
             work: db.open_tree("work")?,
             utxo_by_addr: db.open_tree("utxo_by_addr")?,
+            coinbase_heights: db.open_tree("coinbase_heights")?,
+            spent_utxos: db.open_tree("spent_utxos")?,
             _db: db,
         })
     }
@@ -623,7 +630,7 @@ impl NullaDb {
     /// This new function:
     /// - Phase 1: Verify all signatures in parallel (read-only, safe)
     /// - Phase 2: Validate and apply sequentially (atomic, prevents double-spend)
-    pub fn validate_and_apply_block_txs(&self, txs: &[nulla_core::Tx], chain_id: &[u8; 4]) -> Result<u64> {
+    pub fn validate_and_apply_block_txs(&self, txs: &[nulla_core::Tx], chain_id: &[u8; 4], block_height: u64) -> Result<u64> {
         use rayon::prelude::*;
         use std::sync::Mutex;
 
@@ -651,14 +658,40 @@ impl NullaDb {
         let mut total_fees = 0u64;
 
         for tx in txs {
-            // Skip coinbase
             if nulla_core::is_coinbase(tx) {
+                // Apply coinbase transaction and mark outputs with block height for maturity checking
+                let txid = nulla_core::tx_id(tx);
+                for (vout, output) in tx.outputs.iter().enumerate() {
+                    let outpoint = nulla_core::OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    };
+                    self.put_utxo(&outpoint, output)?;
+
+                    // Track coinbase height for maturity validation
+                    self.coinbase_heights.insert(
+                        bincode::serialize(&outpoint)?,
+                        &block_height.to_be_bytes(),
+                    )?;
+                }
                 continue;
             }
 
             // ATOMICALLY: validate fee and apply transaction
             // No other thread can interfere because we're sequential here
             let fee = self.calculate_tx_fee(tx)?;
+
+            // Validate lock_time (MED-001): Transaction cannot be included before lock_time
+            if tx.lock_time > block_height {
+                return Err(DbError::Serde(bincode::Error::new(
+                    bincode::ErrorKind::Custom(
+                        format!(
+                            "Transaction lock_time {} is greater than current block height {}",
+                            tx.lock_time, block_height
+                        )
+                    )
+                )));
+            }
 
             // Check minimum fee
             if fee < 10_000 {
@@ -725,6 +758,37 @@ impl NullaDb {
                     )));
                 }
             };
+
+            // SECURITY: Check coinbase maturity (cannot spend coinbase outputs for 100 blocks)
+            if let Some(coinbase_height_bytes) = self.coinbase_heights.get(bincode::serialize(&input.prevout)?)? {
+                let coinbase_height = u64::from_be_bytes(
+                    coinbase_height_bytes.as_ref().try_into().map_err(|_| {
+                        DbError::Serde(bincode::Error::new(
+                            bincode::ErrorKind::Custom("Invalid coinbase height data".to_string()),
+                        ))
+                    })?
+                );
+
+                // Get current block height from best tip
+                let (_tip, current_height, _work) = self.best_tip()?.unwrap_or((
+                    [0u8; 32],
+                    0,
+                    0,
+                ));
+
+                if current_height < coinbase_height + nulla_core::COINBASE_MATURITY {
+                    return Err(DbError::Serde(bincode::Error::new(
+                        bincode::ErrorKind::Custom(
+                            format!(
+                                "Coinbase output not mature (height {} + {} maturity > current {})",
+                                coinbase_height,
+                                nulla_core::COINBASE_MATURITY,
+                                current_height
+                            )
+                        ),
+                    )));
+                }
+            }
 
             // Parse the script_pubkey to determine type
             let script_pubkey = Script::new(prev_output.script_pubkey.clone());
@@ -830,12 +894,21 @@ impl NullaDb {
     }
 
     /// Apply a transaction to the UTXO set (mark inputs as spent, create new outputs).
+    /// SECURITY FIX (HIGH-007): Backs up spent UTXOs for proper reorg restoration.
     pub fn apply_tx(&self, tx: &nulla_core::Tx) -> Result<()> {
         let txid = nulla_core::tx_id(tx);
 
         // Mark all inputs as spent (skip coinbase inputs)
         for input in &tx.inputs {
             if !input.prevout.is_null() {
+                // SECURITY FIX (HIGH-007): Backup UTXO before removing for reorg restoration
+                if let Some(utxo) = self.get_utxo(&input.prevout)? {
+                    self.spent_utxos.insert(
+                        bincode::serialize(&input.prevout)?,
+                        bincode::serialize(&utxo)?,
+                    )?;
+                }
+
                 self.mark_spent(&input.prevout, &txid)?;
                 self.remove_utxo(&input.prevout)?;
             }
@@ -854,6 +927,7 @@ impl NullaDb {
     }
 
     /// Revert a transaction from the UTXO set (for chain reorganization).
+    /// SECURITY FIX (HIGH-007): Properly restores spent UTXOs from backup.
     pub fn revert_tx(&self, tx: &nulla_core::Tx) -> Result<()> {
         let txid = nulla_core::tx_id(tx);
 
@@ -865,14 +939,25 @@ impl NullaDb {
             };
             self.remove_utxo(&outpoint)?;
             self.unmark_spent(&outpoint)?;
+
+            // Remove coinbase height tracking if this was a coinbase output
+            let _ = self.coinbase_heights.remove(bincode::serialize(&outpoint)?)?;
         }
 
         // Restore inputs (skip coinbase)
-        // Note: This requires the original UTXOs to be stored elsewhere
-        // For now, we'll just unmark them as spent
+        // SECURITY FIX (HIGH-007): Restore original UTXOs from backup
         for input in &tx.inputs {
             if !input.prevout.is_null() {
                 self.unmark_spent(&input.prevout)?;
+
+                // Restore the original UTXO from backup
+                if let Some(utxo_bytes) = self.spent_utxos.get(bincode::serialize(&input.prevout)?)? {
+                    let utxo: nulla_core::TxOut = bincode::deserialize(&utxo_bytes)?;
+                    self.put_utxo(&input.prevout, &utxo)?;
+
+                    // Remove from backup after restoration
+                    self.spent_utxos.remove(bincode::serialize(&input.prevout)?)?;
+                }
             }
         }
 

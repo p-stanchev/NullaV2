@@ -150,6 +150,10 @@ pub enum ValidationError {
     TooManyInputs { count: usize, max: usize },
     #[error("too many outputs: {count} (max {max})")]
     TooManyOutputs { count: usize, max: usize },
+    #[error("invalid checkpoint format")]
+    InvalidCheckpoint,
+    #[error("checkpoint mismatch: block hash doesn't match hardcoded checkpoint")]
+    CheckpointMismatch,
 }
 
 /// Check if a transaction is a coinbase transaction (first tx in block with null input).
@@ -434,6 +438,56 @@ pub const MAX_TX_OUTPUTS: usize = 10_000;         // Maximum outputs per transac
 /// Maximum block size in bytes (4 MB).
 /// This prevents DoS attacks via oversized blocks.
 pub const MAX_BLOCK_SIZE: usize = 4_000_000;
+
+/// Coinbase maturity depth (100 blocks).
+/// Coinbase outputs cannot be spent until 100 blocks have been mined after them.
+/// This prevents miners from spending rewards from blocks that might be orphaned.
+pub const COINBASE_MATURITY: u64 = 100;
+
+/// Hardcoded blockchain checkpoints for security (HIGH-012).
+/// These prevent attackers from feeding fake chains during initial sync.
+/// Format: (block_height, block_hash)
+///
+/// IMPORTANT: Update these with known-good blocks from the main chain.
+/// Genesis block (height 0) should always be checkpointed.
+pub const CHECKPOINTS: &[(u64, &str)] = &[
+    // Genesis block - update this with your actual genesis hash after first run
+    // (0, "0000000000000000000000000000000000000000000000000000000000000000"),
+
+    // Add checkpoints every 10,000 blocks for good coverage
+    // Example format (update with real hashes from your blockchain):
+    // (10000, "actual_block_hash_at_height_10000"),
+    // (20000, "actual_block_hash_at_height_20000"),
+];
+
+/// Validate that a block at a checkpoint height matches the expected hash.
+/// Returns Ok(()) if validation passes or if height is not a checkpoint.
+pub fn validate_checkpoint(height: u64, block_id: &Hash32) -> Result<(), ValidationError> {
+    for (checkpoint_height, checkpoint_hash_hex) in CHECKPOINTS {
+        if height == *checkpoint_height {
+            // Decode the checkpoint hash from hex
+            let expected_hash = hex::decode(checkpoint_hash_hex)
+                .map_err(|_| ValidationError::InvalidCheckpoint)?;
+
+            if expected_hash.len() != 32 {
+                return Err(ValidationError::InvalidCheckpoint);
+            }
+
+            let mut hash_array = [0u8; 32];
+            hash_array.copy_from_slice(&expected_hash);
+
+            if block_id != &hash_array {
+                return Err(ValidationError::CheckpointMismatch);
+            }
+
+            // Checkpoint validated successfully
+            return Ok(());
+        }
+    }
+
+    // Not a checkpoint height, validation passes
+    Ok(())
+}
 
 /// Validate a complete block, checking:
 /// - The block size does not exceed MAX_BLOCK_SIZE

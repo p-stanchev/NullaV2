@@ -2527,6 +2527,7 @@ dependencies = [
  "blake3",
  "bytes",
  "ed25519-dalek",
+ "hex",
  "k256",
  "num-bigint",
  "num-traits",

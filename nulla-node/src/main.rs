@@ -940,6 +940,11 @@ async fn handle_network_events(
     // Track connected peers to avoid duplicate connection log messages
     let mut connected_peers: HashSet<libp2p::PeerId> = HashSet::new();
 
+    // TODO (MED-004, CRIT-003): Implement per-IP connection limits for eclipse attack protection
+    // libp2p doesn't directly expose peer IP addresses from PeerId
+    // Would need to track connection manager events to get actual IP addresses
+    // For now, rely on libp2p's built-in connection limits
+
     while let Ok(evt) = rx.recv().await {
         match evt {
             NetworkEvent::TxInv { from, txid } => {
@@ -1493,9 +1498,16 @@ async fn process_full_block(
         return;
     }
 
+    // Validate checkpoint (SECURITY FIX: HIGH-012)
+    if let Err(e) = nulla_core::validate_checkpoint(block.header.height, &block_id) {
+        warn!("received block failed checkpoint validation: {e}");
+        return;
+    }
+
     // Validate and apply all transactions atomically (SECURITY FIX: CRIT-NEW-003)
     // Signatures verified in parallel, UTXO validation + application sequential (atomic)
-    let total_fees = match db.validate_and_apply_block_txs(&block.txs, chain_id) {
+    // Also tracks coinbase heights for maturity validation
+    let total_fees = match db.validate_and_apply_block_txs(&block.txs, chain_id, block.header.height) {
         Ok(fees) => fees,
         Err(e) => {
             warn!("block rejected: atomic validation failed: {e}");
@@ -2162,6 +2174,17 @@ fn spawn_miner_real(
                 nulla_wallet::atoms_to_nulla(nulla_wallet::BLOCK_REWARD_ATOMS)
             );
 
+            // Validate and apply all transactions atomically (SECURITY FIX: CRIT-006)
+            // This matches the same atomic validation used for received blocks
+            // Also tracks coinbase heights for maturity validation
+            let _total_fees = match db.validate_and_apply_block_txs(&block.txs, &chain_id, next_height) {
+                Ok(fees) => fees,
+                Err(e) => {
+                    warn!("miner: block validation failed (should not happen): {e}");
+                    continue;
+                }
+            };
+
             // Store the full block (header + transactions).
             if let Err(e) = db.put_block_full(&block) {
                 warn!("miner: failed to store block: {e}");
@@ -2176,12 +2199,8 @@ fn spawn_miner_real(
                 continue;
             }
 
-            // Apply all transactions (including coinbase) to UTXO set
-            for tx in &block.txs {
-                if let Err(e) = db.apply_tx(tx) {
-                    warn!("miner: failed to apply transaction: {e}");
-                }
-            }
+            // Transactions already applied atomically by validate_and_apply_block_txs() above
+            // SECURITY: Removed separate apply_tx() loop to prevent double-application (CRIT-006)
 
             // Remove transactions from mempool now that they're in a block
             for (i, tx) in block.txs.iter().enumerate().skip(1) {

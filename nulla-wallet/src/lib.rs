@@ -12,13 +12,14 @@ pub mod address;
 pub mod multisig;
 pub mod psbt;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use nulla_core::{OutPoint, Tx, TxIn, TxOut};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // Re-export address types
 pub use address::{Address, AddressVersion};
@@ -141,7 +142,8 @@ pub fn parse_derivation_path(path: &str) -> Result<Vec<u32>> {
 }
 
 /// A wallet keypair for signing transactions.
-#[derive(Clone)]
+/// SECURITY FIX (CRIT-005): Implements ZeroizeOnDrop to clear private keys from memory.
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct Keypair {
     /// Ed25519 signing key (private key).
     signing_key: SigningKey,
@@ -153,6 +155,8 @@ impl Keypair {
         let mut seed = [0u8; 32];
         rand::RngCore::fill_bytes(&mut OsRng, &mut seed);
         let signing_key = SigningKey::from_bytes(&seed);
+        // SECURITY FIX (CRIT-005): Zeroize seed after use
+        seed.zeroize();
         Self { signing_key }
     }
 
@@ -492,9 +496,10 @@ pub fn verify_signature(
     // Compute sighash with chain ID
     let sighash = compute_sighash(tx, chain_id)?;
 
-    // Verify the signature
+    // Verify the signature using strict verification
+    // SECURITY FIX (CRIT-002): verify_strict() prevents signature malleability
     public_key
-        .verify(&sighash, &signature)
+        .verify_strict(&sighash, &signature)
         .map_err(|_| WalletError::InvalidSignature)
 }
 
@@ -513,8 +518,9 @@ pub fn verify_signature_legacy(tx: &Tx, signature_bytes: &[u8], public_key: &Ver
     );
 
     let tx_data = bincode::serialize(tx)?;
+    // SECURITY FIX (CRIT-002): verify_strict() prevents signature malleability
     public_key
-        .verify(&tx_data, &signature)
+        .verify_strict(&tx_data, &signature)
         .map_err(|_| WalletError::InvalidSignature)
 }
 

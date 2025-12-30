@@ -16,3 +16,4 @@ thiserror.workspace = true
 ed25519-dalek.workspace = true
 num-bigint.workspace = true  # SECURITY: For safe difficulty calculation (CRIT-NEW-004)
 num-traits.workspace = true  # For BigUint traits
+hex.workspace = true  # For checkpoint hash decoding (HIGH-012)

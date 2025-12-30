@@ -384,7 +384,7 @@ impl ScriptInterpreter {
         }
 
         // Parse Ed25519 signature and public key
-        use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+        use ed25519_dalek::{Signature, VerifyingKey};
 
         let sig = Signature::from_slice(signature)
             .map_err(|_| ScriptError::InvalidSignature)?;
@@ -394,8 +394,9 @@ impl ScriptInterpreter {
                 .map_err(|_| ScriptError::InvalidSignature)?
         ).map_err(|_| ScriptError::InvalidSignature)?;
 
-        // Verify the signature against the sighash
-        vk.verify(sighash, &sig)
+        // Verify the signature against the sighash using strict verification
+        // SECURITY FIX (CRIT-002): verify_strict() prevents signature malleability
+        vk.verify_strict(sighash, &sig)
             .map_err(|_| ScriptError::SignatureVerificationFailed)?;
 
         Ok(())
@@ -476,7 +477,7 @@ impl ScriptInterpreter {
         pubkey: &[u8; 32],
         sighash: &[u8],
     ) -> Result<(), ScriptError> {
-        use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+        use ed25519_dalek::{Signature, VerifyingKey};
 
         // Check resource limits (signature verification counts as an operation)
         if self.op_count > limits::MAX_OPERATIONS {
@@ -495,7 +496,8 @@ impl ScriptInterpreter {
         let vk = VerifyingKey::from_bytes(pubkey)
             .map_err(|_| ScriptError::InvalidSignature)?;
 
-        vk.verify(sighash, &sig)
+        // SECURITY FIX (CRIT-002): verify_strict() prevents signature malleability
+        vk.verify_strict(sighash, &sig)
             .map_err(|_| ScriptError::SignatureVerificationFailed)?;
 
         Ok(())

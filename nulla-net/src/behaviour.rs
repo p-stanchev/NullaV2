@@ -26,9 +26,10 @@ pub fn build_behaviour(
     let peer_id = PeerId::from(keypair.public());
 
     // Configure gossipsub for reliable message propagation.
+    // SECURITY FIX (HIGH-003): Increased from 64KB to 5MB to support MAX_BLOCK_SIZE (4MB)
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .validation_mode(gossipsub::ValidationMode::Strict)
-        .max_transmit_size(1024 * 64)
+        .max_transmit_size(1024 * 1024 * 5) // 5MB to accommodate 4MB blocks + overhead
         .build()
         .expect("gossipsub config");
 

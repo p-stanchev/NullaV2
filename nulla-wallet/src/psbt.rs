@@ -6,7 +6,7 @@
 //! - Safe transaction construction and signing coordination
 
 use crate::WalletError;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use nulla_core::{Tx, TxOut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -260,7 +260,8 @@ impl Psbt {
                     .map_err(|_| WalletError::InvalidInput("Invalid public key length".into()))?)
                     .map_err(|_| WalletError::InvalidInput("Invalid public key".into()))?;
 
-                verifying_key.verify(&sighash, &signature)
+                // SECURITY FIX (CRIT-002): verify_strict() prevents signature malleability
+                verifying_key.verify_strict(&sighash, &signature)
                     .map_err(|_| WalletError::InvalidInput(
                         format!("Signature verification failed for input {} - this may indicate \
                                 a chain_id mismatch or tampered signatures", i)
