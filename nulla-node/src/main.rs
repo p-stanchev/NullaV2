@@ -1328,21 +1328,23 @@ async fn handle_network_events(
                     match resp {
                         protocol::Resp::Tip {
                             height,
-                            id: _,
+                            id,
                             cumulative_work: _,
                         } => {
                             let local_tip =
                                 db.best_tip().ok().flatten();
                             let local_height = local_tip.as_ref().map(|(_, h, _)| *h).unwrap_or(0);
                             if height > local_height {
-                                // Request headers starting from OUR tip, not the peer's tip
-                                // GetHeaders walks backwards, so we need to start from our local chain
-                                let from_id = local_tip.map(|(id, _, _)| id).unwrap_or([0u8; 32]);
+                                // GetHeaders walks backwards from the given block
+                                // So we pass the PEER'S tip and it returns headers backwards to genesis
+                                // We'll process them in reverse order to apply them forward
+                                info!("requesting headers from {} starting at peer's tip {} (local height: {}, peer height: {})",
+                                    peer, hex::encode(id), local_height, height);
                                 let _ = cmd_tx
                                     .send(NetworkCommand::SendRequest {
                                         peer,
                                         req: protocol::Req::GetHeaders {
-                                            from: from_id,
+                                            from: id,
                                             limit: protocol::MAX_HEADERS as u32,
                                         },
                                     })
@@ -1350,11 +1352,19 @@ async fn handle_network_events(
                             }
                         }
                         protocol::Resp::Headers { headers } => {
+                            info!("received {} headers from {}", headers.len(), peer);
+
+                            // Headers come in REVERSE order (newest to oldest)
+                            // We need to process them in FORWARD order (oldest to newest)
+                            let mut headers_vec = headers.clone();
+                            headers_vec.reverse();
+
                             let mut requested = 0usize;
-                            for header in headers {
+                            for header in headers_vec {
                                 let block_id = nulla_core::block_header_id(&header);
                                 if db.get_block(&block_id).ok().flatten().is_none() {
                                     let _ = db.put_header(&header);
+                                    debug!("requesting block {} at height {}", hex::encode(block_id), header.height);
                                     let _ = cmd_tx
                                         .send(NetworkCommand::SendRequest {
                                             peer,
@@ -1367,6 +1377,7 @@ async fn handle_network_events(
                                     }
                                 }
                             }
+                            info!("requested {} blocks from {}", requested, peer);
                         }
                         protocol::Resp::Block { block } => {
                             if let Some(block) = block {
