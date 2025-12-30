@@ -146,11 +146,23 @@ The stub miner broadcasts independent dummy blocks every 30 seconds. Unlike `--s
 
 ### Quick Start: Wallet Setup
 
+**Note:** On Windows, replace `nulla` with:
+- `cargo run -p nulla-node --` (during development), or
+- `.\target\release\nulla.exe` (after running `cargo build --release`)
+
+On Linux/macOS, use `./target/release/nulla` or add it to your PATH.
+
 #### Option 1: Simple Wallet (Single Address)
 
 ```bash
-# Generate a new wallet
+# Linux/macOS
 nulla --generate-wallet
+
+# Windows (development)
+cargo run -p nulla-node -- --generate-wallet
+
+# Windows (release)
+.\target\release\nulla.exe --generate-wallet
 ```
 
 Output:
@@ -241,77 +253,171 @@ nulla --wallet-file wallet.seed --get-balance
 nulla --wallet-file wallet.seed --derive-address 10
 ```
 
-### Mining Setup
+### Mining and Seed Node Setup
 
-Mining creates new blocks and earns block rewards. You need a wallet address to receive rewards.
+**What do these modes do?**
+- `--mine`: Enable proof-of-work mining (creates new blocks, earns rewards)
+- `--seed`: Enable seed mode (relay/sync only, does NOT mine, helps bootstrap network)
+- `--miner-address`: Your address that receives block rewards (public, safe to share)
 
-#### Single Machine Setup (Development/Testing)
+**Important Distinctions:**
+- **Miner**: Creates new blocks with `--mine` (earns rewards)
+- **Seed Node**: Relays blocks with `--seed` (does NOT create blocks, does NOT earn rewards)
+- **Do NOT use both together** - pick one role per node
+- You don't need `--wallet-file` for mining! Wallet file is only needed to **spend** rewards later.
+
+#### Quick Start: Single Machine (Windows)
+
+```powershell
+# Step 1: Generate wallet and get address
+cargo run -p nulla-node -- --generate-hd-wallet
+# Save the master seed and copy address [0]
+
+# Step 2: Save wallet seed to file (for spending rewards later)
+echo YOUR_MASTER_SEED_HERE > wallet.seed
+
+# Step 3: Start mining (development mode)
+cargo run -p nulla-node -- --mine --miner-address YOUR_ADDRESS_HERE --gossip
+
+# Step 3 (alternative): Start mining (release mode - faster)
+cargo build --release
+.\target\release\nulla.exe --mine --miner-address YOUR_ADDRESS_HERE --gossip
+```
+
+#### Quick Start: Single Machine (Linux/macOS)
 
 ```bash
 # Step 1: Generate wallet and get address
-nulla --generate-hd-wallet
-# Copy the first address (e.g., 79bc6374ccc99f1211770ce007e05f6235b98c8b)
+cargo run -p nulla-node -- --generate-hd-wallet
+# Save the master seed and copy address [0]
 
-# Step 2: Save the master seed
+# Step 2: Save wallet seed to file
 echo "YOUR_MASTER_SEED_HERE" > wallet.seed
+chmod 600 wallet.seed
 
-# Step 3: Start mining with your address
-nulla --mine --miner-address 79bc6374ccc99f1211770ce007e05f6235b98c8b --seed
+# Step 3: Start mining (development mode)
+cargo run -p nulla-node -- --mine --miner-address YOUR_ADDRESS_HERE --gossip
+
+# Step 3 (alternative): Start mining (release mode - faster)
+cargo build --release
+./target/release/nulla --mine --miner-address YOUR_ADDRESS_HERE --gossip
 ```
 
-**Parameters:**
-- `--mine`: Enable proof-of-work mining
-- `--miner-address`: Your address that receives block rewards (public address, safe to expose)
-- `--seed`: Enable seed mode (proper blockchain building)
+**What happens:** Your node will mine blocks every ~60 seconds and send rewards to your address. You'll see logs like:
+```
+INFO miner: found block at height 1
+INFO updated best tip to height 1
+```
 
-**Note:** You don't need `--wallet-file` for mining! The miner address is public. You only need the wallet file later when you want to **spend** your rewards.
+#### Production Setup: VPS Miner + Local Node
 
-#### Production Setup (VPS + Local Node)
+This setup runs mining on a VPS (always online) and a local node that syncs from the VPS.
 
-**On VPS (Linux - Seed + Miner):**
+**Step 1: Setup VPS (Linux - The Miner)**
 
 ```bash
-# Step 1: Build the release binary
+# SSH into your VPS
+ssh user@YOUR_VPS_IP
+
+# Navigate to project directory
+cd nulla
+
+# Pull latest code and rebuild
+git pull
 cargo clean
 cargo build --release
 
-# Step 2: Generate wallet
+# Generate wallet
 ./target/release/nulla --generate-hd-wallet
-# Copy the first address and save the master seed securely!
+# ⚠️  SAVE THE MASTER SEED AND ADDRESS [0]!
 
-# Step 3: Save wallet seed for later (to spend rewards)
+# Save wallet seed (for spending rewards later)
 echo "YOUR_MASTER_SEED" > wallet.seed
 chmod 600 wallet.seed
 
-# Step 4: Run seed + miner (wallet file NOT needed for mining)
+# Run miner (using screen or tmux recommended for background)
 ./target/release/nulla \
-  --seed \
   --mine \
   --miner-address YOUR_ADDRESS_HERE \
   --listen /ip4/0.0.0.0/tcp/27444 \
   --gossip
 ```
 
-**On Local Machine (Windows/Mac - Regular Node):**
+**Step 2: Setup Local Machine (Windows - The Syncer)**
 
-```bash
-# Step 1: Rebuild to match VPS version
+```powershell
+# In your local Nulla directory
+cd C:\Users\stanc\Desktop\Nulla
+
+# Pull latest code and rebuild (MUST match VPS version!)
+git pull
 cargo clean
 cargo build --release
 
-# Step 2: Connect to VPS (no mining)
+# Connect to VPS and sync (NO mining on local machine!)
+.\target\release\nulla.exe --peers /ip4/YOUR_VPS_IP/tcp/27444 --rpc 127.0.0.1:27447 --gossip
+```
+
+**Step 2 (alternative): Setup Local Machine (Linux/macOS - The Syncer)**
+
+```bash
+# Pull latest code and rebuild
+git pull
+cargo clean
+cargo build --release
+
+# Connect to VPS and sync
+./target/release/nulla --peers /ip4/YOUR_VPS_IP/tcp/27444 --rpc 127.0.0.1:27447 --gossip
+```
+
+**What You'll See:**
+
+On VPS (miner):
+```
+INFO miner: found block at height 1 (took 45s)
+INFO broadcasting block to peers
+```
+
+On Local Machine (syncer):
+```
+INFO peer connected 12D3KooW...
+INFO received 500 mempool transactions from peer
+[00:01:23] =========>------------- 150/500 blocks (00:02:15)
+INFO sync tick: height=150 tip=a1b2c3d4 work=5000000 mempool=0
+```
+
+**Critical Notes:**
+- ⚠️  **Only VPS should mine** (use `--mine` only, NOT `--seed`)
+- ⚠️  **Local machine should NOT mine** (only syncs blocks)
+- ⚠️  **Both must run same code version** (rebuild both after any updates)
+- ✅  VPS needs `--listen` to accept connections
+- ✅  Local needs `--peers` with VPS IP address
+- ✅  Use `--miner-address` (public) NOT `--wallet-seed` (private)
+- ℹ️  `--seed` mode is for relay nodes (no mining, no rewards) - use `--mine` for earning
+
+#### When to Use Seed Mode (`--seed`)
+
+Use `--seed` mode when you want to run a **relay/bootstrap node** that helps the network but doesn't mine:
+
+```bash
+# Seed node (relay only, no mining, no rewards)
 ./target/release/nulla \
-  --peers /ip4/YOUR_VPS_IP/tcp/27444 \
-  --rpc 127.0.0.1:27447 \
+  --seed \
+  --listen /ip4/0.0.0.0/tcp/27444 \
   --gossip
 ```
 
-**Important Notes:**
-- ✅ Only run mining on ONE machine (typically VPS) to avoid chain splits
-- ✅ Rebuild both machines with same code version to ensure compatibility
-- ✅ VPS should use `--seed --mine` together for proper blockchain
-- ✅ Local machine should NOT use `--mine` (just syncs blocks)
-- ✅ Use `--miner-address` instead of `--wallet-seed` (more secure)
+**Seed nodes:**
+- ✅ Relay blocks and transactions to other peers
+- ✅ Help bootstrap new nodes joining the network
+- ✅ Sync blockchain state from other peers
+- ❌ Do NOT create new blocks
+- ❌ Do NOT earn mining rewards
+
+**Use cases for seed nodes:**
+- Public bootstrap nodes for the network
+- Always-online relay nodes to improve network health
+- Infrastructure nodes that help peers discover each other
 
 #### Advanced: Encrypted Wallet for Mining
 
@@ -319,11 +425,10 @@ cargo build --release
 # Step 1: Create encrypted wallet
 nulla --create-wallet wallet.dat --wallet-password "SecurePass123"
 
-# Step 2: Mine with encrypted wallet
-nulla --mine --seed \
-  --wallet-file wallet.dat \
-  --wallet-password "SecurePass123" \
-  --miner-address YOUR_ADDRESS
+# Step 2: Mine (wallet file not needed, just the address)
+nulla --mine --miner-address YOUR_ADDRESS
+
+# Note: Wallet file is only needed later when you want to spend rewards
 ```
 
 ### Sending Transactions
