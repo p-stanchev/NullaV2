@@ -994,7 +994,7 @@ async fn handle_network_events(
     _seed_mode: bool,
     chain_id: [u8; 4],
 ) {
-    use std::collections::HashSet;
+    use std::collections::{HashSet, HashMap};
     use nulla_core::OutPoint;
 
     // SECURITY: Track spent outpoints in mempool to prevent double-spend attacks
@@ -1003,6 +1003,12 @@ async fn handle_network_events(
 
     // Track connected peers to avoid duplicate connection log messages
     let mut connected_peers: HashSet<libp2p::PeerId> = HashSet::new();
+
+    // Orphan block pool: blocks waiting for their parent to arrive
+    // Maps block_id -> (block, peer_id)
+    let mut orphan_blocks: HashMap<Hash32, (nulla_core::Block, Option<libp2p::PeerId>)> = HashMap::new();
+    // Maps parent_id -> Vec<child_block_ids> for quick lookup
+    let mut orphan_children: HashMap<Hash32, Vec<Hash32>> = HashMap::new();
 
     // TODO (MED-004, CRIT-003): Implement per-IP connection limits for eclipse attack protection
     // libp2p doesn't directly expose peer IP addresses from PeerId
@@ -1228,7 +1234,24 @@ async fn handle_network_events(
                     .await;
             }
             NetworkEvent::FullBlock { from, block } => {
+                let block_id = nulla_core::block_id(&block);
                 let block_clone = block.clone();
+
+                // Check if parent exists
+                let has_parent = block.header.prev == [0u8; 32] ||
+                    db.get_block(&block.header.prev).ok().flatten().is_some();
+
+                if !has_parent {
+                    // Store as orphan and wait for parent
+                    debug!("storing orphan block {} at height {} (missing parent {})",
+                        hex::encode(block_id), block.header.height, hex::encode(block.header.prev));
+                    orphan_blocks.insert(block_id, (block.clone(), Some(from)));
+                    orphan_children.entry(block.header.prev)
+                        .or_insert_with(Vec::new)
+                        .push(block_id);
+                    continue;
+                }
+
                 let is_valid = process_full_block(&db, &sync_progress, block, Some(from), &chain_id).await;
 
                 // Re-broadcast valid blocks to gossip network (relay to other peers)
@@ -1236,6 +1259,34 @@ async fn handle_network_events(
                     let _ = cmd_tx
                         .send(nulla_net::NetworkCommand::PublishFullBlock { block: block_clone })
                         .await;
+
+                    // Process orphan children if any
+                    if let Some(children_ids) = orphan_children.remove(&block_id) {
+                        info!("processing {} orphan children of block {}", children_ids.len(), hex::encode(block_id));
+                        for child_id in children_ids {
+                            if let Some((child_block, child_from)) = orphan_blocks.remove(&child_id) {
+                                debug!("processing orphan child {} at height {}", hex::encode(child_id), child_block.header.height);
+                                let child_clone = child_block.clone();
+                                let child_valid = process_full_block(&db, &sync_progress, child_block, child_from, &chain_id).await;
+                                if child_valid {
+                                    let _ = cmd_tx
+                                        .send(nulla_net::NetworkCommand::PublishFullBlock { block: child_clone })
+                                        .await;
+
+                                    // Recursively process grandchildren
+                                    if let Some(grandchildren) = orphan_children.remove(&child_id) {
+                                        // Re-insert grandchildren for next iteration
+                                        for grandchild_id in grandchildren {
+                                            if let Some((gc_block, gc_from)) = orphan_blocks.remove(&grandchild_id) {
+                                                orphan_blocks.insert(grandchild_id, (gc_block, gc_from));
+                                                orphan_children.entry(child_id).or_insert_with(Vec::new).push(grandchild_id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             NetworkEvent::Request { peer, req, channel } => {
@@ -1381,7 +1432,36 @@ async fn handle_network_events(
                     }
                     protocol::Resp::Block { block } => {
                         if let Some(block) = block {
-                            process_full_block(&db, &sync_progress, block, Some(peer), &chain_id).await;
+                            let block_id = nulla_core::block_id(&block);
+
+                            // Check if parent exists
+                            let has_parent = block.header.prev == [0u8; 32] ||
+                                db.get_block(&block.header.prev).ok().flatten().is_some();
+
+                            if !has_parent {
+                                // Store as orphan and wait for parent
+                                debug!("storing orphan block {} at height {} (missing parent {})",
+                                    hex::encode(block_id), block.header.height, hex::encode(block.header.prev));
+                                orphan_blocks.insert(block_id, (block.clone(), Some(peer)));
+                                orphan_children.entry(block.header.prev)
+                                    .or_insert_with(Vec::new)
+                                    .push(block_id);
+                            } else {
+                                let is_valid = process_full_block(&db, &sync_progress, block, Some(peer), &chain_id).await;
+
+                                // Process orphan children if this block's processing succeeded
+                                if is_valid {
+                                    if let Some(children_ids) = orphan_children.remove(&block_id) {
+                                        info!("processing {} orphan children of block {}", children_ids.len(), hex::encode(block_id));
+                                        for child_id in children_ids {
+                                            if let Some((child_block, child_from)) = orphan_blocks.remove(&child_id) {
+                                                debug!("processing orphan child {} at height {}", hex::encode(child_id), child_block.header.height);
+                                                process_full_block(&db, &sync_progress, child_block, child_from, &chain_id).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -1573,14 +1653,7 @@ async fn process_full_block(
         return false; // Don't re-broadcast blocks we already have
     }
 
-    // Check if we have the parent block (unless this is genesis)
-    if block.header.prev != [0u8; 32] {
-        if db.get_block(&block.header.prev).ok().flatten().is_none() {
-            debug!("missing parent block {} for block {} at height {}, skipping until parent arrives",
-                hex::encode(block.header.prev), hex::encode(block_id), block.header.height);
-            return false; // Don't process or re-broadcast blocks with missing parents
-        }
-    }
+    // Parent check is now done by the caller (orphan pool logic)
 
     if let Err(e) = nulla_core::validate_block(&block) {
         warn!("received invalid block (structure): {e}");
