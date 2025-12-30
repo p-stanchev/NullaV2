@@ -991,7 +991,7 @@ async fn handle_network_events(
     cmd_tx: async_channel::Sender<NetworkCommand>,
     db: NullaDb,
     sync_progress: Arc<Mutex<Option<ProgressBar>>>,
-    seed_mode: bool,
+    _seed_mode: bool,
     chain_id: [u8; 4],
 ) {
     use std::collections::HashSet;
@@ -1324,68 +1324,67 @@ async fn handle_network_events(
                     }
                 }
 
-                if seed_mode {
-                    match resp {
-                        protocol::Resp::Tip {
-                            height,
-                            id,
-                            cumulative_work: _,
-                        } => {
-                            let local_tip =
-                                db.best_tip().ok().flatten();
-                            let local_height = local_tip.as_ref().map(|(_, h, _)| *h).unwrap_or(0);
-                            if height > local_height {
-                                // GetHeaders walks backwards from the given block
-                                // So we pass the PEER'S tip and it returns headers backwards to genesis
-                                // We'll process them in reverse order to apply them forward
-                                info!("requesting headers from {} starting at peer's tip {} (local height: {}, peer height: {})",
-                                    peer, hex::encode(id), local_height, height);
+                // ALL nodes (not just seed nodes) should sync blocks from peers
+                match resp {
+                    protocol::Resp::Tip {
+                        height,
+                        id,
+                        cumulative_work: _,
+                    } => {
+                        let local_tip =
+                            db.best_tip().ok().flatten();
+                        let local_height = local_tip.as_ref().map(|(_, h, _)| *h).unwrap_or(0);
+                        if height > local_height {
+                            // GetHeaders walks backwards from the given block
+                            // So we pass the PEER'S tip and it returns headers backwards to genesis
+                            // We'll process them in reverse order to apply them forward
+                            info!("requesting headers from {} starting at peer's tip {} (local height: {}, peer height: {})",
+                                peer, hex::encode(id), local_height, height);
+                            let _ = cmd_tx
+                                .send(NetworkCommand::SendRequest {
+                                    peer,
+                                    req: protocol::Req::GetHeaders {
+                                        from: id,
+                                        limit: protocol::MAX_HEADERS as u32,
+                                    },
+                                })
+                                .await;
+                        }
+                    }
+                    protocol::Resp::Headers { headers } => {
+                        info!("received {} headers from {}", headers.len(), peer);
+
+                        // Headers come in REVERSE order (newest to oldest)
+                        // We need to process them in FORWARD order (oldest to newest)
+                        let mut headers_vec = headers.clone();
+                        headers_vec.reverse();
+
+                        let mut requested = 0usize;
+                        for header in headers_vec {
+                            let block_id = nulla_core::block_header_id(&header);
+                            if db.get_block(&block_id).ok().flatten().is_none() {
+                                let _ = db.put_header(&header);
+                                debug!("requesting block {} at height {}", hex::encode(block_id), header.height);
                                 let _ = cmd_tx
                                     .send(NetworkCommand::SendRequest {
                                         peer,
-                                        req: protocol::Req::GetHeaders {
-                                            from: id,
-                                            limit: protocol::MAX_HEADERS as u32,
-                                        },
+                                        req: protocol::Req::GetBlock { id: block_id },
                                     })
                                     .await;
-                            }
-                        }
-                        protocol::Resp::Headers { headers } => {
-                            info!("received {} headers from {}", headers.len(), peer);
-
-                            // Headers come in REVERSE order (newest to oldest)
-                            // We need to process them in FORWARD order (oldest to newest)
-                            let mut headers_vec = headers.clone();
-                            headers_vec.reverse();
-
-                            let mut requested = 0usize;
-                            for header in headers_vec {
-                                let block_id = nulla_core::block_header_id(&header);
-                                if db.get_block(&block_id).ok().flatten().is_none() {
-                                    let _ = db.put_header(&header);
-                                    debug!("requesting block {} at height {}", hex::encode(block_id), header.height);
-                                    let _ = cmd_tx
-                                        .send(NetworkCommand::SendRequest {
-                                            peer,
-                                            req: protocol::Req::GetBlock { id: block_id },
-                                        })
-                                        .await;
-                                    requested += 1;
-                                    if requested >= 128 {
-                                        break;
-                                    }
+                                requested += 1;
+                                if requested >= 128 {
+                                    break;
                                 }
                             }
-                            info!("requested {} blocks from {}", requested, peer);
                         }
-                        protocol::Resp::Block { block } => {
-                            if let Some(block) = block {
-                                process_full_block(&db, &sync_progress, block, Some(peer), &chain_id).await;
-                            }
-                        }
-                        _ => {}
+                        info!("requested {} blocks from {}", requested, peer);
                     }
+                    protocol::Resp::Block { block } => {
+                        if let Some(block) = block {
+                            process_full_block(&db, &sync_progress, block, Some(peer), &chain_id).await;
+                        }
+                    }
+                    _ => {}
                 }
             }
             NetworkEvent::NewListen(addr) => info!("listening on {addr}"),
@@ -1402,14 +1401,13 @@ async fn handle_network_events(
                         })
                         .await;
 
-                    if seed_mode {
-                        let _ = cmd_tx
-                            .send(NetworkCommand::SendRequest {
-                                peer,
-                                req: protocol::Req::GetTip,
-                            })
-                            .await;
-                    }
+                    // ALL nodes should request tip to sync blocks (not just seed nodes)
+                    let _ = cmd_tx
+                        .send(NetworkCommand::SendRequest {
+                            peer,
+                            req: protocol::Req::GetTip,
+                        })
+                        .await;
                 }
             }
             NetworkEvent::PeerDisconnected(peer) => {
