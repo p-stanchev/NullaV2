@@ -20,6 +20,11 @@ use tokio::sync::Mutex;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+/// Maximum depth for chain reorganizations (SECURITY FIX: HIGH-NEW-002).
+/// Reorgs deeper than 100 blocks are rejected to prevent DoS attacks.
+/// Bitcoin uses ~6 blocks for finality; 100 blocks provides ample safety margin.
+const MAX_REORG_DEPTH: usize = 100;
+
 /// Command-line arguments for the Nulla node.
 #[derive(Parser, Debug)]
 #[command(name = "nulla", about = "Nulla minimal node", version)]
@@ -118,11 +123,26 @@ struct Args {
     #[arg(long)]
     derive_address: Option<u32>,
 
+    /// DEPRECATED: Use environment variable NULLA_WALLET_SEED or --wallet-seed-stdin instead.
+    /// WARNING: Command-line arguments are visible in process listings (ps aux)!
+    /// This option exposes your seed in shell history and process monitors.
+    ///
     /// Wallet seed (32 bytes hex) to use for signing transactions.
     /// WARNING: Only use for transaction signing, NOT for mining!
     /// For mining, use --miner-address instead to avoid exposing your private key.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use NULLA_WALLET_SEED environment variable or --wallet-seed-stdin instead. \
+                CLI arguments expose seeds in process listings and shell history."
+    )]
     #[arg(long)]
     wallet_seed: Option<String>,
+
+    /// Read wallet seed from stdin (secure, not visible in ps).
+    /// The node will prompt for the seed on startup.
+    /// This is more secure than --wallet-seed as it doesn't expose the seed in process listings.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    wallet_seed_stdin: bool,
 
     /// Get wallet address from seed.
     #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -251,6 +271,7 @@ async fn main() -> Result<()> {
 
     // Handle derive address command.
     if let Some(count) = args.derive_address {
+        #[allow(deprecated)]
         if let Some(seed_hex) = &args.wallet_seed {
             match hex::decode(seed_hex) {
                 Ok(seed_bytes) if seed_bytes.len() == 32 => {
@@ -280,6 +301,7 @@ async fn main() -> Result<()> {
 
     // Handle get address command.
     if args.get_address {
+        #[allow(deprecated)]
         if let Some(seed_hex) = &args.wallet_seed {
             match hex::decode(seed_hex) {
                 Ok(seed_bytes) if seed_bytes.len() == 32 => {
@@ -303,6 +325,7 @@ async fn main() -> Result<()> {
 
     // Handle get balance command.
     if args.get_balance {
+        #[allow(deprecated)]
         if let Some(seed_hex) = &args.wallet_seed {
             match hex::decode(seed_hex) {
                 Ok(seed_bytes) if seed_bytes.len() == 32 => {
@@ -405,20 +428,23 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
-        } else if let Some(wallet_seed) = &args.wallet_seed {
-            let seed_bytes = match hex::decode(wallet_seed) {
-                Ok(bytes) if bytes.len() == 32 => bytes,
-                _ => {
-                    eprintln!("Error: Invalid wallet seed (must be 32 bytes hex)");
-                    std::process::exit(1);
-                }
-            };
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&seed_bytes);
-            Wallet::from_seed(&seed)
         } else {
-            eprintln!("Error: --wallet-seed or --wallet-file required for --send");
-            std::process::exit(1);
+            #[allow(deprecated)]
+            if let Some(wallet_seed) = &args.wallet_seed {
+                let seed_bytes = match hex::decode(wallet_seed) {
+                    Ok(bytes) if bytes.len() == 32 => bytes,
+                    _ => {
+                        eprintln!("Error: Invalid wallet seed (must be 32 bytes hex)");
+                        std::process::exit(1);
+                    }
+                };
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&seed_bytes);
+                Wallet::from_seed(&seed)
+            } else {
+                eprintln!("Error: --wallet-seed or --wallet-file required for --send");
+                std::process::exit(1);
+            }
         };
 
         // Parse recipient address.
@@ -541,8 +567,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Add transaction to mempool.
-        if let Err(e) = db.put_mempool_tx(&tx) {
+        // Add transaction to mempool (signature validation enforced)
+        if let Err(e) = db.put_mempool_tx(&tx, &chain_id) {
             eprintln!("Error adding transaction to mempool: {}", e);
             std::process::exit(1);
         }
@@ -608,9 +634,9 @@ async fn main() -> Result<()> {
 
     info!("starting nulla-node chain_id={:?}", args.chain_id);
 
-    // Load wallet from either seed or encrypted file.
+    // SECURITY FIX (CRIT-NEW-002): Secure wallet loading
     let wallet = if let Some(wallet_path) = &args.wallet_file {
-        // Load from encrypted wallet file
+        // Option 1: Load from encrypted wallet file (most secure)
         let password = args.wallet_password.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Error: --wallet-password required with --wallet-file")
         })?;
@@ -627,23 +653,101 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-    } else if let Some(seed_hex) = &args.wallet_seed {
-        // Load from hex seed
+    } else if let Ok(seed_hex) = std::env::var("NULLA_WALLET_SEED") {
+        // Option 2: Load from environment variable (secure - not in ps)
+        use zeroize::Zeroize;
+
+        match hex::decode(&seed_hex) {
+            Ok(seed_bytes) if seed_bytes.len() == 32 => {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&seed_bytes);
+                let wallet = Wallet::from_seed(&seed);
+                info!("wallet loaded from NULLA_WALLET_SEED environment variable");
+                info!("wallet address: {}", wallet.address());
+
+                // Zeroize the seed after use
+                seed.zeroize();
+
+                Some(wallet)
+            }
+            _ => {
+                warn!("invalid NULLA_WALLET_SEED (must be 32 bytes hex), ignoring");
+                None
+            }
+        }
+    } else if args.wallet_seed_stdin {
+        // Option 3: Load from stdin (secure - not in ps or shell history)
+        use std::io::{self, BufRead};
+        use zeroize::Zeroize;
+
+        println!("Enter wallet seed (32 bytes hex):");
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line)?;
+
+        let seed_hex = line.trim();
         match hex::decode(seed_hex) {
             Ok(seed_bytes) if seed_bytes.len() == 32 => {
                 let mut seed = [0u8; 32];
                 seed.copy_from_slice(&seed_bytes);
                 let wallet = Wallet::from_seed(&seed);
-                info!("wallet loaded from seed, address: {}", wallet.address());
+                info!("wallet loaded from stdin");
+                info!("wallet address: {}", wallet.address());
+
+                // Zeroize sensitive data
+                seed.zeroize();
+                line.zeroize();
+
                 Some(wallet)
             }
             _ => {
-                warn!("invalid wallet seed (must be 32 bytes hex), ignoring");
-                None
+                eprintln!("Error: Invalid wallet seed (must be 32 bytes hex)");
+                std::process::exit(1);
             }
         }
     } else {
-        None
+        // Option 4: DEPRECATED - Load from CLI argument (INSECURE!)
+        #[allow(deprecated)]
+        if let Some(seed_hex) = &args.wallet_seed {
+            use zeroize::Zeroize;
+
+            eprintln!("⚠️  SECURITY WARNING: --wallet-seed is DEPRECATED and INSECURE!");
+            eprintln!("⚠️  Your seed is visible in:");
+            eprintln!("   - Process listings (ps aux, htop, etc.)");
+            eprintln!("   - Shell history (~/.bash_history, ~/.zsh_history)");
+            eprintln!("   - Process monitoring tools");
+            eprintln!("   - System logs");
+            eprintln!("");
+            eprintln!("Use one of these secure alternatives:");
+            eprintln!("  1. Environment variable:");
+            eprintln!("     NULLA_WALLET_SEED=<seed> nulla-node ...");
+            eprintln!("  2. Standard input (prompts for seed):");
+            eprintln!("     nulla-node --wallet-seed-stdin ...");
+            eprintln!("  3. Encrypted wallet file (recommended):");
+            eprintln!("     nulla-node --wallet-file wallet.dat --wallet-password <password> ...");
+            eprintln!("");
+            eprintln!("Continuing in 5 seconds...");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+
+            match hex::decode(seed_hex) {
+                Ok(seed_bytes) if seed_bytes.len() == 32 => {
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&seed_bytes);
+                    let wallet = Wallet::from_seed(&seed);
+                    info!("wallet loaded from seed (DEPRECATED), address: {}", wallet.address());
+
+                    // Zeroize seed
+                    seed.zeroize();
+
+                    Some(wallet)
+                }
+                _ => {
+                    warn!("invalid wallet seed (must be 32 bytes hex), ignoring");
+                    None
+                }
+            }
+        } else {
+            None
+        }
     };
 
     // Parse miner address if provided (for receiving block rewards without exposing private key).
@@ -752,13 +856,14 @@ async fn main() -> Result<()> {
         let wallet_arc = wallet.as_ref()
             .map(|w| Arc::new(tokio::sync::RwLock::new(w.clone())));
 
-        let rpc_ctx = nulla_rpc::RpcContext {
-            db: db.clone(),
-            network_tx: cmd_tx.clone(),
-            wallet: wallet_arc,
-            start_time: std::time::Instant::now(),
+        // SECURITY FIX (HIGH-NEW-003): Use RpcContext::new() which includes rate limiting
+        let rpc_ctx = nulla_rpc::RpcContext::new(
+            db.clone(),
+            cmd_tx.clone(),
+            wallet_arc,
+            std::time::Instant::now(),
             chain_id,
-        };
+        );
 
         match nulla_rpc::spawn_rpc_server(args.rpc.clone(), rpc_ctx).await {
             Ok(handle) => {
@@ -904,8 +1009,8 @@ async fn handle_network_events(
                     }
                 }
 
-                // Add to mempool
-                if let Err(e) = db.put_mempool_tx(&tx) {
+                // Add to mempool (signature validation enforced in put_mempool_tx)
+                if let Err(e) = db.put_mempool_tx(&tx, &chain_id) {
                     warn!("failed to add transaction to mempool: {e}");
                     continue;
                 }
@@ -1088,9 +1193,9 @@ async fn handle_network_events(
                                     continue;
                                 }
 
-                                // Add to local mempool
+                                // Add to local mempool (signature validation enforced in put_mempool_tx)
                                 let txid = nulla_core::tx_id(tx);
-                                if let Err(e) = db.put_mempool_tx(tx) {
+                                if let Err(e) = db.put_mempool_tx(tx, &chain_id) {
                                     warn!("failed to add mempool tx {}: {}", hex::encode(txid), e);
                                 } else {
                                     // SECURITY: Mark inputs as spent in mempool tracker
@@ -1245,6 +1350,28 @@ async fn perform_reorg(
         .copied()
         .collect();
 
+    // SECURITY FIX (HIGH-NEW-002): Enforce maximum reorg depth
+    let reorg_depth = blocks_to_revert.len();
+    if reorg_depth > MAX_REORG_DEPTH {
+        warn!(
+            "SECURITY: Rejecting reorg of depth {} (max: {})",
+            reorg_depth, MAX_REORG_DEPTH
+        );
+        return Err(anyhow::anyhow!(
+            "reorg depth {} exceeds maximum allowed depth of {}",
+            reorg_depth,
+            MAX_REORG_DEPTH
+        ));
+    }
+
+    if reorg_depth > 10 {
+        warn!(
+            "WARNING: Deep reorg of {} blocks detected (common ancestor: {})",
+            reorg_depth,
+            hex::encode(common_ancestor)
+        );
+    }
+
     info!("  reverting {} blocks from old chain", blocks_to_revert.len());
     for block_id in blocks_to_revert {
         if let Some(block) = db.get_block(&block_id)? {
@@ -1321,11 +1448,22 @@ async fn process_full_block(
         return;
     }
 
-    // Validate all transactions in parallel with replay protection (2-4x faster on multi-core CPUs)
-    let total_fees = match db.validate_block_txs_parallel(&block.txs, chain_id) {
+    // Validate block timestamp (SECURITY FIX: HIGH-NEW-001)
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    if let Err(e) = nulla_core::validate_block_timestamp(&block, get_header, current_time) {
+        warn!("received block with invalid timestamp: {e}");
+        return;
+    }
+
+    // Validate and apply all transactions atomically (SECURITY FIX: CRIT-NEW-003)
+    // Signatures verified in parallel, UTXO validation + application sequential (atomic)
+    let total_fees = match db.validate_and_apply_block_txs(&block.txs, chain_id) {
         Ok(fees) => fees,
         Err(e) => {
-            warn!("block rejected: parallel validation failed: {e}");
+            warn!("block rejected: atomic validation failed: {e}");
             return;
         }
     };
@@ -1362,11 +1500,8 @@ async fn process_full_block(
         warn!("failed to store cumulative work: {e}");
     }
 
-    for tx in &block.txs {
-        if let Err(e) = db.apply_tx(tx) {
-            warn!("failed to apply transaction: {e}");
-        }
-    }
+    // Transactions already applied atomically by validate_and_apply_block_txs() above
+    // SECURITY: Removed separate apply_tx() loop to prevent TOCTOU (CRIT-NEW-003)
 
     for tx in block.txs.iter().skip(1) {
         let txid = nulla_core::tx_id(tx);
@@ -1479,8 +1614,27 @@ fn handle_request(db: &NullaDb, req: protocol::Req) -> protocol::Resp {
             }
         }
         protocol::Req::GetHeaders { from, limit } => {
-            // Traverse the chain backwards from the given hash and return block headers.
+            // SECURITY FIX (HIGH-NEW-005): Validate starting hash before processing
             info!("get headers from {} limit {}", hex::encode(from), limit);
+
+            // Validate that the starting block exists
+            match db.get_block(&from) {
+                Ok(Some(_)) => {
+                    // Starting block exists, proceed with traversal
+                }
+                Ok(None) => {
+                    // Block not found - this could be a probe attack or outdated peer
+                    warn!(
+                        "SECURITY: GetHeaders request for non-existent block {}",
+                        hex::encode(from)
+                    );
+                    return protocol::Resp::Err { code: 404 }; // Not Found
+                }
+                Err(e) => {
+                    warn!("Database error in GetHeaders: {}", e);
+                    return protocol::Resp::Err { code: 500 }; // Internal Server Error
+                }
+            }
 
             let mut headers = Vec::new();
             let mut current_id = from;

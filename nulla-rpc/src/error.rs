@@ -22,6 +22,9 @@ pub enum RpcErrorCode {
     VerifyError = -25,
     VerifyRejected = -26,
     InWarmup = -28,
+
+    // SECURITY FIX (HIGH-AUD-001): Rate limiting error
+    TooManyRequests = -29,
 }
 
 /// RPC error type
@@ -59,6 +62,9 @@ pub enum RpcError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
 }
 
 impl RpcError {
@@ -138,6 +144,13 @@ impl RpcError {
             RpcError::Internal(msg) => {
                 ErrorObjectOwned::owned(
                     RpcErrorCode::InternalError as i32,
+                    msg,
+                    None::<()>,
+                )
+            }
+            RpcError::TooManyRequests(msg) => {
+                ErrorObjectOwned::owned(
+                    RpcErrorCode::TooManyRequests as i32,
                     msg,
                     None::<()>,
                 )

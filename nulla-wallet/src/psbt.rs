@@ -6,7 +6,7 @@
 //! - Safe transaction construction and signing coordination
 
 use crate::WalletError;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use nulla_core::{Tx, TxOut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -22,6 +22,10 @@ pub struct Psbt {
 
     /// Output metadata for each output
     pub outputs: Vec<PsbtOutput>,
+
+    /// Chain ID for replay protection (SECURITY FIX: CRIT-NEW-001)
+    /// This ensures signatures can't be replayed across different chains
+    pub chain_id: [u8; 4],
 }
 
 /// Metadata for a transaction input
@@ -48,8 +52,12 @@ pub struct PsbtOutput {
 }
 
 impl Psbt {
-    /// Create a new PSBT from an unsigned transaction
-    pub fn new(unsigned_tx: Tx) -> Self {
+    /// Create a new PSBT from an unsigned transaction with chain ID
+    ///
+    /// # Security
+    /// The chain_id is included in all signature hashes to prevent replay attacks
+    /// across different chains (mainnet, testnet, etc.)
+    pub fn new(unsigned_tx: Tx, chain_id: [u8; 4]) -> Self {
         let input_count = unsigned_tx.inputs.len();
         let output_count = unsigned_tx.outputs.len();
 
@@ -57,6 +65,7 @@ impl Psbt {
             unsigned_tx,
             inputs: vec![PsbtInput::default(); input_count],
             outputs: vec![PsbtOutput::default(); output_count],
+            chain_id,
         }
     }
 
@@ -82,6 +91,11 @@ impl Psbt {
     }
 
     /// Sign an input with a private key
+    ///
+    /// # Security (CRIT-NEW-001 FIX)
+    /// The signature hash now includes the chain_id to prevent replay attacks.
+    /// This ensures that signatures created for one chain (e.g., mainnet) cannot
+    /// be replayed on another chain (e.g., testnet).
     pub fn sign_input(
         &mut self,
         input_index: usize,
@@ -91,12 +105,18 @@ impl Psbt {
             return Err(WalletError::InvalidInput("Input index out of bounds".into()));
         }
 
-        // Serialize the transaction for signing
-        let tx_data = bincode::serialize(&self.unsigned_tx)
-            .map_err(|e| WalletError::InvalidInput(format!("Serialization failed: {}", e)))?;
+        // SECURITY: Compute sighash WITH chain_id for replay protection
+        let sighash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&self.chain_id);  // Include chain_id first
+            let tx_data = bincode::serialize(&self.unsigned_tx)
+                .map_err(|e| WalletError::InvalidInput(format!("Serialization failed: {}", e)))?;
+            hasher.update(&tx_data);
+            hasher.finalize().as_bytes().to_vec()
+        };
 
-        // Sign the transaction
-        let signature = signing_key.sign(&tx_data);
+        // Sign the sighash
+        let signature = signing_key.sign(&sighash);
         let verifying_key = signing_key.verifying_key();
 
         self.add_signature(input_index, &verifying_key, signature)?;
@@ -205,9 +225,47 @@ impl Psbt {
     /// This combines all the partial signatures into the actual transaction.
     /// For P2PKH: Uses the single signature and pubkey
     /// For P2SH: Uses all signatures + redeem script
+    ///
+    /// # Security (CRIT-NEW-001 FIX)
+    /// All signatures are verified with the chain_id before finalization to ensure
+    /// they were created for the correct chain. This prevents tampering with the
+    /// chain_id after signatures are collected.
     pub fn finalize(&self) -> Result<Tx, WalletError> {
         if !self.is_complete() {
             return Err(WalletError::InvalidInput("PSBT is not complete - need more signatures".into()));
+        }
+
+        // SECURITY: Compute sighash with chain_id for signature verification
+        let sighash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&self.chain_id);
+            let tx_data = bincode::serialize(&self.unsigned_tx)
+                .map_err(|e| WalletError::InvalidInput(format!("Serialization failed: {}", e)))?;
+            hasher.update(&tx_data);
+            hasher.finalize().as_bytes().to_vec()
+        };
+
+        // SECURITY: Verify all signatures before finalizing
+        for (i, input_meta) in self.inputs.iter().enumerate() {
+            if input_meta.partial_sigs.is_empty() {
+                return Err(WalletError::InvalidInput(format!("Input {} has no signatures", i)));
+            }
+
+            // Verify each signature with the chain_id-included sighash
+            for (pubkey_bytes, sig_bytes) in &input_meta.partial_sigs {
+                let signature = Signature::from_bytes(&sig_bytes.as_slice().try_into()
+                    .map_err(|_| WalletError::InvalidInput("Invalid signature length".into()))?);
+
+                let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes.as_slice().try_into()
+                    .map_err(|_| WalletError::InvalidInput("Invalid public key length".into()))?)
+                    .map_err(|_| WalletError::InvalidInput("Invalid public key".into()))?;
+
+                verifying_key.verify(&sighash, &signature)
+                    .map_err(|_| WalletError::InvalidInput(
+                        format!("Signature verification failed for input {} - this may indicate \
+                                a chain_id mismatch or tampered signatures", i)
+                    ))?;
+            }
         }
 
         let mut tx = self.unsigned_tx.clone();
@@ -321,6 +379,9 @@ impl Default for PsbtOutput {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use nulla_core::{OutPoint, TxIn, Script};
+
+    const TEST_CHAIN_ID: [u8; 4] = *b"TEST";  // Testnet chain ID
 
     #[test]
     fn test_psbt_creation() {
@@ -341,11 +402,12 @@ mod tests {
             lock_time: 0,
         };
 
-        let psbt = Psbt::new(tx.clone());
+        let psbt = Psbt::new(tx.clone(), TEST_CHAIN_ID);
 
         assert_eq!(psbt.unsigned_tx.version, tx.version);
         assert_eq!(psbt.inputs.len(), 1);
         assert_eq!(psbt.outputs.len(), 1);
+        assert_eq!(psbt.chain_id, TEST_CHAIN_ID);
         assert!(!psbt.is_complete());
     }
 
@@ -368,7 +430,7 @@ mod tests {
             lock_time: 0,
         };
 
-        let mut psbt = Psbt::new(tx);
+        let mut psbt = Psbt::new(tx, TEST_CHAIN_ID);
 
         // Sign with a key
         let signing_key = SigningKey::from_bytes(&[0x42; 32]);
@@ -403,7 +465,7 @@ mod tests {
             lock_time: 0,
         };
 
-        let mut psbt = Psbt::new(tx);
+        let mut psbt = Psbt::new(tx, TEST_CHAIN_ID);
 
         // Create redeem script for 2-of-3
         let pk1 = [0x01; 32];
@@ -451,7 +513,7 @@ mod tests {
             lock_time: 0,
         };
 
-        let mut psbt = Psbt::new(tx);
+        let mut psbt = Psbt::new(tx, TEST_CHAIN_ID);
         let sk = SigningKey::from_bytes(&[0x99; 32]);
         psbt.sign_input(0, &sk).unwrap();
 
@@ -461,5 +523,47 @@ mod tests {
 
         assert_eq!(psbt.signature_count(0), psbt2.signature_count(0));
         assert_eq!(psbt.is_complete(), psbt2.is_complete());
+        assert_eq!(psbt.chain_id, psbt2.chain_id);
+    }
+
+    /// SECURITY TEST (CRIT-NEW-001): Test replay protection across chains
+    #[test]
+    fn test_psbt_replay_protection() {
+        let chain_id_main = *b"MAIN";
+        let chain_id_test = *b"TEST";
+
+        let tx = Tx {
+            version: 1,
+            inputs: vec![TxIn {
+                prevout: OutPoint {
+                    txid: [4u8; 32],
+                    vout: 0,
+                },
+                sig: Vec::new(),
+                pubkey: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value_atoms: 1000,
+                script_pubkey: Vec::new(),
+            }],
+            lock_time: 0,
+        };
+
+        // Create PSBT with mainnet chain_id
+        let signing_key = SigningKey::from_bytes(&[0x55; 32]);
+        let mut psbt_main = Psbt::new(tx.clone(), chain_id_main);
+        psbt_main.sign_input(0, &signing_key).unwrap();
+
+        // Finalize with correct chain_id should succeed
+        assert!(psbt_main.finalize().is_ok());
+
+        // Try to tamper with chain_id after signing
+        let mut psbt_tampered = psbt_main.clone();
+        psbt_tampered.chain_id = chain_id_test;
+
+        // Finalization should fail because signatures were created with different chain_id
+        let result = psbt_tampered.finalize();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("chain_id mismatch"));
     }
 }

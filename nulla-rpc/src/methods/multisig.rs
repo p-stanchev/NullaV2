@@ -23,7 +23,10 @@ pub struct PsbtInfo {
 /// Register multi-signature RPC methods.
 pub fn register_methods(module: &mut jsonrpsee::RpcModule<RpcContext>) -> anyhow::Result<()> {
     // createmultisig - Create a multi-signature address
-    module.register_method("createmultisig", |params, _ctx| {
+    module.register_method("createmultisig", |params, ctx| {
+        // SECURITY FIX (HIGH-AUD-001): Enforce rate limiting
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
         let (required, pubkeys_hex): (u8, Vec<String>) = params.parse()?;
 
         // Parse public keys from hex
@@ -56,7 +59,10 @@ pub fn register_methods(module: &mut jsonrpsee::RpcModule<RpcContext>) -> anyhow
     })?;
 
     // createpsbt - Create a Partially Signed Bitcoin Transaction
-    module.register_method("createpsbt", |params, _ctx| {
+    module.register_method("createpsbt", |params, ctx| {
+        // SECURITY FIX (HIGH-AUD-001): Enforce rate limiting
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
         let tx_hex: String = params.one()?;
 
         // Decode transaction
@@ -66,8 +72,8 @@ pub fn register_methods(module: &mut jsonrpsee::RpcModule<RpcContext>) -> anyhow
         let tx: nulla_core::Tx = bincode::deserialize(&tx_bytes)
             .map_err(|e| RpcError::InvalidParameter(format!("Invalid transaction: {}", e)).into_error_object())?;
 
-        // Create PSBT
-        let psbt = Psbt::new(tx);
+        // Create PSBT with chain_id from context (SECURITY FIX: CRIT-NEW-001)
+        let psbt = Psbt::new(tx, ctx.chain_id);
         let psbt_hex = psbt.to_hex()
             .map_err(|e| RpcError::InvalidTransaction(e.to_string()).into_error_object())?;
 
@@ -76,6 +82,9 @@ pub fn register_methods(module: &mut jsonrpsee::RpcModule<RpcContext>) -> anyhow
 
     // signpsbt - Sign a PSBT with wallet keys
     module.register_async_method("signpsbt", |params, ctx| async move {
+        // SECURITY FIX (HIGH-AUD-001): Enforce rate limiting
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
         let psbt_hex: String = params.one()?;
 
         // Get wallet
@@ -107,7 +116,10 @@ pub fn register_methods(module: &mut jsonrpsee::RpcModule<RpcContext>) -> anyhow
     })?;
 
     // combinepsbt - Combine multiple PSBTs
-    module.register_method("combinepsbt", |params, _ctx| {
+    module.register_method("combinepsbt", |params, ctx| {
+        // SECURITY FIX (HIGH-AUD-001): Enforce rate limiting
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
         let psbt_hexes: Vec<String> = params.parse()?;
 
         if psbt_hexes.is_empty() {
@@ -153,7 +165,10 @@ pub fn register_methods(module: &mut jsonrpsee::RpcModule<RpcContext>) -> anyhow
     })?;
 
     // finalizepsbt - Finalize a PSBT into a complete transaction
-    module.register_method("finalizepsbt", |params, _ctx| {
+    module.register_method("finalizepsbt", |params, ctx| {
+        // SECURITY FIX (HIGH-AUD-001): Enforce rate limiting
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
         let psbt_hex: String = params.one()?;
 
         // Decode PSBT
@@ -177,7 +192,10 @@ pub fn register_methods(module: &mut jsonrpsee::RpcModule<RpcContext>) -> anyhow
     })?;
 
     // decodepsbt - Decode a PSBT to JSON
-    module.register_method("decodepsbt", |params, _ctx| {
+    module.register_method("decodepsbt", |params, ctx| {
+        // SECURITY FIX (HIGH-AUD-001): Enforce rate limiting
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
         let psbt_hex: String = params.one()?;
 
         // Decode PSBT

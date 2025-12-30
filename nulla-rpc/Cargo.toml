@@ -20,3 +20,4 @@ bincode.workspace = true
 async-trait.workspace = true
 async-channel.workspace = true
 ed25519-dalek.workspace = true
+governor.workspace = true  # SECURITY: For RPC rate limiting (HIGH-NEW-003)

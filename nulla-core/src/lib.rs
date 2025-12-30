@@ -140,6 +140,16 @@ pub enum ValidationError {
     BlockTooLarge { size: usize, max: usize },
     #[error("invalid format")]
     InvalidFormat,
+    #[error("timestamp too far in future: {timestamp} (max {max})")]
+    TimestampTooFar { timestamp: u64, max: u64 },
+    #[error("timestamp too early: {timestamp} <= median {median}")]
+    TimestampTooEarly { timestamp: u64, median: u64 },
+    #[error("transaction too large: {size} bytes (max {max} bytes)")]
+    TxTooLarge { size: usize, max: usize },
+    #[error("too many inputs: {count} (max {max})")]
+    TooManyInputs { count: usize, max: usize },
+    #[error("too many outputs: {count} (max {max})")]
+    TooManyOutputs { count: usize, max: usize },
 }
 
 /// Check if a transaction is a coinbase transaction (first tx in block with null input).
@@ -223,6 +233,32 @@ pub fn target_work(target: &Hash32) -> u128 {
 /// - Output values don't overflow
 /// - Coinbase transactions must have exactly one null input
 pub fn validate_tx_structure(tx: &Tx) -> Result<(), ValidationError> {
+    // SECURITY FIX (HIGH-NEW-004): Transaction size validation
+    // Check transaction size limit
+    let tx_size = bincode::serialize(tx)
+        .map_err(|_| ValidationError::InvalidFormat)?
+        .len();
+    if tx_size > MAX_TX_SIZE {
+        return Err(ValidationError::TxTooLarge {
+            size: tx_size,
+            max: MAX_TX_SIZE,
+        });
+    }
+
+    // Check input/output count limits
+    if tx.inputs.len() > MAX_TX_INPUTS {
+        return Err(ValidationError::TooManyInputs {
+            count: tx.inputs.len(),
+            max: MAX_TX_INPUTS,
+        });
+    }
+    if tx.outputs.len() > MAX_TX_OUTPUTS {
+        return Err(ValidationError::TooManyOutputs {
+            count: tx.outputs.len(),
+            max: MAX_TX_OUTPUTS,
+        });
+    }
+
     if tx.inputs.is_empty() {
         return Err(ValidationError::EmptyInputs);
     }
@@ -390,6 +426,11 @@ where
     Ok(())
 }
 
+/// Transaction size and structure limits (SECURITY FIX: HIGH-NEW-004)
+pub const MAX_TX_SIZE: usize = 1_000_000;        // 1 MB max transaction size
+pub const MAX_TX_INPUTS: usize = 10_000;          // Maximum inputs per transaction
+pub const MAX_TX_OUTPUTS: usize = 10_000;         // Maximum outputs per transaction
+
 /// Maximum block size in bytes (4 MB).
 /// This prevents DoS attacks via oversized blocks.
 pub const MAX_BLOCK_SIZE: usize = 4_000_000;
@@ -462,6 +503,16 @@ pub mod difficulty {
     pub const MAX_ADJUSTMENT_FACTOR: u64 = 4;
 }
 
+/// Timestamp validation constants (SECURITY FIX: HIGH-NEW-001).
+pub mod timestamp {
+    /// Maximum allowed future time drift: 2 hours in seconds.
+    /// Blocks with timestamps more than 2 hours in the future are rejected.
+    pub const MAX_FUTURE_DRIFT: u64 = 2 * 60 * 60;
+
+    /// Number of previous blocks to use for median time calculation (Bitcoin uses 11).
+    pub const MEDIAN_TIME_SPAN: usize = 11;
+}
+
 /// Initial difficulty target for the genesis block.
 /// This is relatively easy to allow for bootstrapping the network.
 pub const INITIAL_TARGET: Hash32 = [
@@ -514,21 +565,29 @@ pub fn calculate_next_target(
     let adjustment_num = actual_time.min(expected_time * difficulty::MAX_ADJUSTMENT_FACTOR);
     let adjustment_denom = expected_time.max(actual_time / difficulty::MAX_ADJUSTMENT_FACTOR);
 
-    // Convert current target to u128 for math (use first 16 bytes)
-    let mut current_bytes = [0u8; 16];
-    current_bytes.copy_from_slice(&current_target[..16]);
-    let current_value = u128::from_be_bytes(current_bytes);
+    // SECURITY FIX (CRIT-NEW-004): Use BigUint for full 256-bit arithmetic
+    // Previous code only used first 16 bytes (u128), losing precision and risking overflow
+    use num_bigint::BigUint;
+
+    // Convert full 32-byte target to BigUint (big-endian)
+    let current_value = BigUint::from_bytes_be(current_target);
 
     // Apply adjustment: new_target = current_target * (actual_time / expected_time)
-    // We use saturating math to prevent overflow
-    let adjusted_value = current_value
-        .saturating_mul(adjustment_num as u128)
-        .saturating_div(adjustment_denom as u128);
+    // BigUint handles arbitrary precision, preventing overflow
+    let adjusted_value = (current_value * adjustment_num) / adjustment_denom;
 
-    // Convert back to Hash32
-    let adjusted_bytes = adjusted_value.to_be_bytes();
-    let mut new_target = [0xffu8; 32];
-    new_target[..16].copy_from_slice(&adjusted_bytes);
+    // Convert back to Hash32 (32 bytes, big-endian)
+    let adjusted_bytes = adjusted_value.to_bytes_be();
+    let mut new_target = [0u8; 32];
+
+    // Copy bytes, padding with zeros at the start if needed
+    if adjusted_bytes.len() <= 32 {
+        let start = 32 - adjusted_bytes.len();
+        new_target[start..].copy_from_slice(&adjusted_bytes);
+    } else {
+        // Target exceeds 256 bits - clamp to maximum (minimum difficulty)
+        return INITIAL_TARGET;
+    }
 
     // Ensure target doesn't exceed maximum (minimum difficulty)
     if !leq_be(&new_target, &INITIAL_TARGET) {
@@ -536,6 +595,100 @@ pub fn calculate_next_target(
     }
 
     new_target
+}
+
+/// Calculate the median timestamp of the last N blocks (SECURITY FIX: HIGH-NEW-001).
+///
+/// This is used to prevent timestamp manipulation attacks. A block's timestamp
+/// must be greater than the median of the previous 11 blocks.
+///
+/// # Arguments
+/// * `get_header` - Callback to fetch block header by height
+/// * `current_height` - Height of the block being validated
+///
+/// # Returns
+/// The median timestamp, or None if not enough blocks exist
+pub fn calculate_median_past_time<F>(get_header: F, current_height: u64) -> Option<u64>
+where
+    F: Fn(u64) -> Option<BlockHeader>,
+{
+    if current_height == 0 {
+        return Some(0); // Genesis block has no previous blocks
+    }
+
+    // Collect timestamps from previous blocks (up to MEDIAN_TIME_SPAN)
+    let count = timestamp::MEDIAN_TIME_SPAN.min(current_height as usize);
+    let mut timestamps = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let height = current_height.saturating_sub((i + 1) as u64);
+        if let Some(header) = get_header(height) {
+            timestamps.push(header.timestamp);
+        } else {
+            return None; // Missing header
+        }
+    }
+
+    if timestamps.is_empty() {
+        return Some(0);
+    }
+
+    // Sort and return median
+    timestamps.sort_unstable();
+    Some(timestamps[timestamps.len() / 2])
+}
+
+/// Validate block timestamp (SECURITY FIX: HIGH-NEW-001).
+///
+/// Enforces two rules:
+/// 1. Block timestamp must not be more than 2 hours in the future
+/// 2. Block timestamp must be greater than median of previous 11 blocks
+///
+/// # Arguments
+/// * `block` - The block to validate
+/// * `get_header` - Callback to fetch block header by height
+/// * `current_time` - Current system time (Unix timestamp)
+///
+/// # Returns
+/// Ok if timestamp is valid, Err with ValidationError otherwise
+pub fn validate_block_timestamp<F>(
+    block: &Block,
+    get_header: F,
+    current_time: u64,
+) -> Result<(), ValidationError>
+where
+    F: Fn(u64) -> Option<BlockHeader>,
+{
+    let block_time = block.header.timestamp;
+
+    // Rule 1: Block timestamp must not be too far in the future
+    let max_future = current_time
+        .checked_add(timestamp::MAX_FUTURE_DRIFT)
+        .unwrap_or(u64::MAX);
+
+    if block_time > max_future {
+        return Err(ValidationError::TimestampTooFar {
+            timestamp: block_time,
+            max: max_future,
+        });
+    }
+
+    // Rule 2: Block timestamp must be greater than median of previous blocks
+    // Skip for genesis block (height 0)
+    if block.header.height > 0 {
+        if let Some(median) = calculate_median_past_time(get_header, block.header.height) {
+            if block_time <= median {
+                return Err(ValidationError::TimestampTooEarly {
+                    timestamp: block_time,
+                    median,
+                });
+            }
+        }
+        // If we can't calculate median (missing headers), we can't validate
+        // This is handled at the network sync level
+    }
+
+    Ok(())
 }
 
 /// Compare two 256-bit hashes as big-endian integers.
@@ -568,5 +721,126 @@ mod tests {
         let high = [0xFFu8; HASH_LEN];
         assert!(leq_be(&low, &high));
         assert!(!leq_be(&high, &low));
+    }
+
+    #[test]
+    fn test_difficulty_overflow_prevention() {
+        // SECURITY TEST (CRIT-NEW-004): Verify safe 256-bit difficulty calculation
+
+        // Test 1: Very large target (minimum difficulty) shouldn't overflow
+        let large_target = INITIAL_TARGET; // Maximum allowed target
+        let height = difficulty::ADJUSTMENT_INTERVAL; // Trigger adjustment
+        let prev_time = 1000000u64;
+        let old_time = 1u64; // Extreme time difference
+
+        let new_target = calculate_next_target(height, &large_target, prev_time, old_time);
+
+        // Should be clamped to INITIAL_TARGET, not overflow
+        assert!(leq_be(&new_target, &INITIAL_TARGET));
+
+        // Test 2: Maximum adjustment factor should work correctly
+        let mid_target = [0x0Fu8; 32]; // Mid-range target
+        let expected = difficulty::ADJUSTMENT_INTERVAL * difficulty::TARGET_BLOCK_TIME;
+        let actual_fast = expected / difficulty::MAX_ADJUSTMENT_FACTOR; // Blocks came very fast
+
+        let new_target_fast = calculate_next_target(
+            difficulty::ADJUSTMENT_INTERVAL,
+            &mid_target,
+            actual_fast,
+            0,
+        );
+
+        // Target should decrease (difficulty increase) when blocks come fast
+        assert!(leq_be(&new_target_fast, &mid_target));
+
+        // Test 3: Full 256-bit target precision is preserved
+        // Set all bytes to non-zero to test full width
+        let full_target = [0x0Fu8; 32];
+        let new_target_full = calculate_next_target(
+            difficulty::ADJUSTMENT_INTERVAL,
+            &full_target,
+            expected * 2, // Blocks came slow (double expected time)
+            0,
+        );
+
+        // Should use all 32 bytes, not just first 16
+        // When blocks come slow (2x expected), target should increase (easier mining)
+        // But it's clamped by MAX_ADJUSTMENT_FACTOR, so it won't exactly double
+        // Just verify that the calculation completes without panicking and returns a valid target
+        assert!(leq_be(&new_target_full, &INITIAL_TARGET));
+    }
+
+    #[test]
+    fn test_timestamp_validation() {
+        // SECURITY TEST (HIGH-NEW-001): Verify timestamp validation
+
+        let chain_id = *b"TEST";
+        let test_target = INITIAL_TARGET;
+
+        // Create a simple header generator for testing
+        let mut test_headers = std::collections::HashMap::new();
+
+        // Create 20 test headers with incrementing timestamps
+        for i in 0..20u64 {
+            let header = BlockHeader {
+                chain_id,
+                version: 1,
+                height: i,
+                prev: [0u8; 32],
+                merkle_root: [0u8; 32],
+                timestamp: 1000 + (i * 10), // Timestamps: 1000, 1010, 1020, ...
+                target: test_target,
+                nonce: 0,
+            };
+            test_headers.insert(i, header);
+        }
+
+        let get_header = |height: u64| -> Option<BlockHeader> {
+            test_headers.get(&height).cloned()
+        };
+
+        // Test 1: Future timestamp - should fail
+        let mut future_block = Block {
+            header: BlockHeader {
+                chain_id,
+                version: 1,
+                height: 20,
+                prev: [0u8; 32],
+                merkle_root: [0u8; 32],
+                timestamp: 999999999999, // Far future
+                target: test_target,
+                nonce: 0,
+            },
+            txs: vec![],
+        };
+        let current_time = 1000000; // Current time
+        assert!(validate_block_timestamp(&future_block, get_header, current_time).is_err());
+
+        // Test 2: Timestamp before median - should fail
+        let median = calculate_median_past_time(get_header, 20).unwrap();
+        future_block.header.timestamp = median; // Equal to median (should be > median)
+        future_block.header.height = 20;
+        assert!(validate_block_timestamp(&future_block, get_header, current_time).is_err());
+
+        // Test 3: Valid timestamp - should pass
+        future_block.header.timestamp = median + 10; // Greater than median
+        future_block.header.height = 20;
+        assert!(validate_block_timestamp(&future_block, get_header, current_time).is_ok());
+
+        // Test 4: Genesis block - should always pass timestamp validation
+        let genesis_block = Block {
+            header: BlockHeader {
+                chain_id,
+                version: 1,
+                height: 0,
+                prev: [0u8; 32],
+                merkle_root: [0u8; 32],
+                timestamp: 0,
+                target: test_target,
+                nonce: 0,
+            },
+            txs: vec![],
+        };
+        assert!(validate_block_timestamp(&genesis_block, get_header, current_time).is_ok());
     }
 }

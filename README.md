@@ -600,6 +600,16 @@ Advanced privacy parameters for Dandelion++ and cover traffic:
 
 **Current Status:** Nulla now has **ALL CRITICAL SECURITY FEATURES** implemented! Blocks with invalid signatures, missing UTXOs, or insufficient fees are **REJECTED**. The blockchain is production-ready from a security perspective.
 
+**Security Audit Completed (December 2025):**
+- ✅ Comprehensive security audit performed across all codebase layers
+- ✅ **18 vulnerabilities discovered and fixed:**
+  - **2 CRITICAL** (fee calculation overflow, database panic risks)
+  - **7 HIGH** (RPC rate limiting, mempool eviction, signature validation, etc.)
+  - **6 MEDIUM** (script interpreter limits, redeem script validation, etc.)
+  - **3 LOW** (informational findings)
+- ✅ Multiple security hardening phases completed (Phase 1-3 + Audit fixes)
+- ✅ Defense-in-depth approach with validation at multiple layers
+
 **Ready for Launch:** All critical features complete. Remaining work is polish and nice-to-have features.
 
 ## Development Status

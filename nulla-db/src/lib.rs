@@ -11,6 +11,10 @@ use sled::{Config, Db, Tree};
 use std::path::Path;
 use thiserror::Error;
 
+/// Mempool size limits (SECURITY FIX: HIGH-NEW-006)
+const MAX_MEMPOOL_SIZE_BYTES: usize = 300_000_000;  // 300 MB
+const MAX_MEMPOOL_TX_COUNT: usize = 50_000;          // 50k transactions
+
 /// Extract address bytes from a P2PKH-like script_pubkey.
 /// Returns Some([20-byte address]) if the script is valid P2PKH format.
 fn extract_address_bytes(script_pubkey: &[u8]) -> Option<Vec<u8>> {
@@ -45,6 +49,8 @@ pub enum DbError {
     Sled(#[from] sled::Error),
     #[error(transparent)]
     Serde(#[from] bincode::Error),
+    #[error("mempool is full (max {} transactions, {} MB)", MAX_MEMPOOL_TX_COUNT, MAX_MEMPOOL_SIZE_BYTES / 1_000_000)]
+    MempoolFull,
 }
 
 /// Result type for database operations.
@@ -113,16 +119,30 @@ impl NullaDb {
             }
             None => return Ok(None),
         };
-        let height = self
-            .meta
-            .get(META_BEST_HEIGHT)?
-            .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8; 8])))
-            .unwrap_or(0);
-        let work = self
-            .meta
-            .get(META_BEST_WORK)?
-            .map(|v| u128::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8; 16])))
-            .unwrap_or(0);
+        // SECURITY FIX (CRIT-AUD-002): Proper error handling instead of unwrap_or
+        let height = match self.meta.get(META_BEST_HEIGHT)? {
+            Some(v) => {
+                let bytes: [u8; 8] = v.as_ref().try_into().map_err(|_| {
+                    DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
+                        "Invalid height bytes in database".to_string(),
+                    )))
+                })?;
+                u64::from_be_bytes(bytes)
+            }
+            None => 0,
+        };
+
+        let work = match self.meta.get(META_BEST_WORK)? {
+            Some(v) => {
+                let bytes: [u8; 16] = v.as_ref().try_into().map_err(|_| {
+                    DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
+                        "Invalid work bytes in database".to_string(),
+                    )))
+                })?;
+                u128::from_be_bytes(bytes)
+            }
+            None => 0,
+        };
         Ok(Some((tip, height, work)))
     }
 
@@ -130,7 +150,12 @@ impl NullaDb {
     pub fn get_work(&self, id: &Hash32) -> Result<Option<u128>> {
         match self.work.get(id)? {
             Some(bytes) => {
-                let arr: [u8; 16] = bytes.as_ref().try_into().unwrap_or([0u8; 16]);
+                // SECURITY FIX (CRIT-AUD-002): Proper error handling
+                let arr: [u8; 16] = bytes.as_ref().try_into().map_err(|_| {
+                    DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
+                        "Invalid work bytes in database".to_string(),
+                    )))
+                })?;
                 Ok(Some(u128::from_be_bytes(arr)))
             }
             None => Ok(None),
@@ -175,10 +200,44 @@ impl NullaDb {
         }
     }
 
-    /// Add a transaction to the mempool.
-    pub fn put_mempool_tx(&self, tx: &Tx) -> Result<()> {
+    /// Add a transaction to the mempool (SECURITY FIX: HIGH-NEW-006, HIGH-AUD-004).
+    /// Validates signatures and enforces mempool size limits by evicting low-fee transactions if necessary.
+    pub fn put_mempool_tx(&self, tx: &Tx, chain_id: &[u8; 4]) -> Result<()> {
+        // SECURITY FIX (HIGH-AUD-004): Validate signatures before accepting into mempool
+        self.verify_tx_signatures(tx, chain_id)
+            .map_err(|e| DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
+                format!("Transaction signature verification failed: {}", e)
+            ))))?;
+
         let txid = nulla_core::tx_id(tx);
-        self.mempool.insert(txid, bincode::serialize(tx)?)?;
+        let tx_bytes = bincode::serialize(tx)?;
+        let tx_size = tx_bytes.len();
+
+        // Check if mempool is at capacity and evict if necessary
+        let tx_count = self.mempool.len();
+        let byte_count = self.mempool_size_bytes()?;
+
+        if tx_count >= MAX_MEMPOOL_TX_COUNT
+            || byte_count + tx_size > MAX_MEMPOOL_SIZE_BYTES
+        {
+            // Evict low-fee transactions to make space
+            let evicted = self.evict_low_fee_txs_until_space(tx_size)?;
+            if evicted > 0 {
+                tracing::debug!("Evicted {} low-fee transactions to make space in mempool", evicted);
+            }
+
+            // Check again after eviction
+            let tx_count_after = self.mempool.len();
+            let byte_count_after = self.mempool_size_bytes()?;
+
+            if tx_count_after >= MAX_MEMPOOL_TX_COUNT
+                || byte_count_after + tx_size > MAX_MEMPOOL_SIZE_BYTES
+            {
+                return Err(DbError::MempoolFull);
+            }
+        }
+
+        self.mempool.insert(txid, tx_bytes)?;
         Ok(())
     }
 
@@ -291,6 +350,87 @@ impl NullaDb {
         Ok(())
     }
 
+    /// Calculate total byte size of all transactions in mempool (SECURITY FIX: HIGH-NEW-006)
+    pub fn mempool_size_bytes(&self) -> Result<usize> {
+        let mut total_bytes = 0usize;
+        for item in self.mempool.iter() {
+            let (_key, value) = item?;
+            total_bytes += value.len();
+        }
+        Ok(total_bytes)
+    }
+
+    /// Evict the lowest fee transaction from the mempool (SECURITY FIX: HIGH-NEW-006)
+    /// Returns the txid of the evicted transaction, or None if mempool is empty
+    fn evict_lowest_fee_tx(&self) -> Result<Option<Hash32>> {
+        let mut txs_with_fees = Vec::new();
+
+        // Collect all transactions with their actual fees (SECURITY FIX: HIGH-AUD-003)
+        for item in self.mempool.iter() {
+            let (key, value) = item?;
+            let tx: Tx = bincode::deserialize(&value)?;
+
+            // Calculate actual fee using calculate_tx_fee (inputs - outputs)
+            let fee = match self.calculate_tx_fee(&tx) {
+                Ok(f) => f,
+                Err(_) => {
+                    // If fee calculation fails, treat as zero fee (evict first)
+                    0
+                }
+            };
+
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&key);
+
+            txs_with_fees.push((txid, fee));
+        }
+
+        if txs_with_fees.is_empty() {
+            return Ok(None);
+        }
+
+        // SECURITY FIX (HIGH-AUD-003): Sort by actual fee (ascending) - lowest fee first
+        txs_with_fees.sort_by_key(|(_, fee)| *fee);
+
+        // Evict the first one (lowest fee)
+        let (evict_txid, _) = txs_with_fees[0];
+        self.remove_mempool_tx(&evict_txid)?;
+
+        Ok(Some(evict_txid))
+    }
+
+    /// Evict low-fee transactions until mempool is under limits (SECURITY FIX: HIGH-NEW-006)
+    pub fn evict_low_fee_txs_until_space(&self, needed_bytes: usize) -> Result<usize> {
+        let mut evicted_count = 0;
+
+        loop {
+            let tx_count = self.mempool.len();
+            let byte_count = self.mempool_size_bytes()?;
+
+            // Check if we're under limits
+            if tx_count < MAX_MEMPOOL_TX_COUNT
+                && byte_count + needed_bytes <= MAX_MEMPOOL_SIZE_BYTES
+            {
+                break;
+            }
+
+            // Evict one transaction
+            match self.evict_lowest_fee_tx()? {
+                Some(_txid) => {
+                    evicted_count += 1;
+                }
+                None => break, // Mempool empty
+            }
+
+            // Safety: prevent infinite loop
+            if evicted_count > 1000 {
+                break;
+            }
+        }
+
+        Ok(evicted_count)
+    }
+
     /// Get a block header by height.
     pub fn get_header_by_height(&self, height: u64) -> Result<Option<BlockHeader>> {
         match self.header_by_height.get(&height.to_be_bytes())? {
@@ -376,18 +516,18 @@ impl NullaDb {
             })?;
         }
 
-        // Fee = inputs - outputs
-        // If outputs > inputs, this is an invalid transaction
-        if total_output > total_input {
-            return Err(DbError::Serde(bincode::Error::new(
-                bincode::ErrorKind::Custom(format!(
-                    "Outputs ({}) exceed inputs ({})",
+        // Fee = inputs - outputs (SECURITY FIX: CRIT-AUD-001)
+        // Use checked_sub to prevent integer overflow/underflow
+        let fee = total_input.checked_sub(total_output).ok_or_else(|| {
+            DbError::Serde(bincode::Error::new(bincode::ErrorKind::Custom(
+                format!(
+                    "Fee calculation overflow: outputs ({}) exceed inputs ({})",
                     total_output, total_input
-                )),
-            )));
-        }
+                ),
+            )))
+        })?;
 
-        Ok(total_input - total_output)
+        Ok(fee)
     }
 
     /// Validate multiple transactions in parallel using rayon with replay protection.
@@ -405,6 +545,14 @@ impl NullaDb {
     ///
     /// # Performance
     /// Expected 2-4x speedup on 4+ core CPUs compared to serial validation.
+    /// DEPRECATED: Use validate_and_apply_block_txs() instead to prevent TOCTOU attacks.
+    ///
+    /// This function only validates but doesn't apply, creating a gap where UTXOs
+    /// can be spent twice if apply_tx() is called separately.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use validate_and_apply_block_txs() to prevent TOCTOU race conditions"
+    )]
     pub fn validate_block_txs_parallel(&self, txs: &[nulla_core::Tx], chain_id: &[u8; 4]) -> Result<u64> {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -460,6 +608,77 @@ impl NullaDb {
         }
 
         Ok(total_fees.load(Ordering::SeqCst))
+    }
+
+    /// Validate and apply block transactions atomically (SECURITY FIX: CRIT-NEW-003).
+    ///
+    /// This function fixes the TOCTOU (Time-Of-Check-Time-Of-Use) vulnerability by
+    /// ensuring that validation and application of transactions happen atomically.
+    ///
+    /// The previous approach had a race condition:
+    /// 1. validate_block_txs_parallel() validates UTXOs (lock released after)
+    /// 2. apply_tx() called separately without lock (TOCTOU gap!)
+    /// 3. Two threads could both validate spending the same UTXO, then both apply
+    ///
+    /// This new function:
+    /// - Phase 1: Verify all signatures in parallel (read-only, safe)
+    /// - Phase 2: Validate and apply sequentially (atomic, prevents double-spend)
+    pub fn validate_and_apply_block_txs(&self, txs: &[nulla_core::Tx], chain_id: &[u8; 4]) -> Result<u64> {
+        use rayon::prelude::*;
+        use std::sync::Mutex;
+
+        // Phase 1: Verify signatures in parallel (read-only, safe to parallelize)
+        let first_error: Mutex<Option<DbError>> = Mutex::new(None);
+
+        txs.par_iter().for_each(|tx| {
+            if first_error.lock().unwrap().is_some() {
+                return;  // Skip if error already found
+            }
+
+            // Signature verification is parallelizable (read-only operation)
+            if let Err(e) = self.verify_tx_signatures(tx, chain_id) {
+                *first_error.lock().unwrap() = Some(e);
+            }
+        });
+
+        // Fail fast if signatures are invalid
+        if let Some(error) = first_error.into_inner().unwrap() {
+            return Err(error);
+        }
+
+        // Phase 2: Validate UTXOs and apply transactions SEQUENTIALLY
+        // This ensures atomicity: no gap between validation and application
+        let mut total_fees = 0u64;
+
+        for tx in txs {
+            // Skip coinbase
+            if nulla_core::is_coinbase(tx) {
+                continue;
+            }
+
+            // ATOMICALLY: validate fee and apply transaction
+            // No other thread can interfere because we're sequential here
+            let fee = self.calculate_tx_fee(tx)?;
+
+            // Check minimum fee
+            if fee < 10_000 {
+                return Err(DbError::Serde(bincode::Error::new(
+                    bincode::ErrorKind::Custom(
+                        format!("Transaction fee ({}) below minimum (10,000)", fee)
+                    )
+                )));
+            }
+
+            // Apply immediately while we still "own" the UTXOs
+            self.apply_tx(tx)?;
+
+            total_fees = total_fees.checked_add(fee)
+                .ok_or_else(|| DbError::Serde(bincode::Error::new(
+                    bincode::ErrorKind::Custom("Fee overflow".to_string())
+                )))?;
+        }
+
+        Ok(total_fees)
     }
 
     /// Verify Ed25519 signatures on all transaction inputs with replay protection.

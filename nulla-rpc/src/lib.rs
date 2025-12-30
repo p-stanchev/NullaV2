@@ -1,12 +1,16 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
+use std::num::NonZeroU32;
 
 use anyhow::{anyhow, Result};
 use jsonrpsee::server::{ServerBuilder, ServerHandle};
 use jsonrpsee::RpcModule;
 use async_channel::Sender;
 use tokio::sync::RwLock;
+use governor::{Quota, RateLimiter};
+use governor::clock::DefaultClock;
+use governor::state::{InMemoryState, NotKeyed};
 
 use nulla_db::NullaDb;
 use nulla_net::NetworkCommand;
@@ -19,6 +23,12 @@ mod error;
 pub use error::RpcError;
 pub use types::*;
 
+/// RPC server security limits (SECURITY FIX: HIGH-NEW-003)
+const MAX_CONNECTIONS: u32 = 10;
+const MAX_REQUEST_SIZE: u32 = 10 * 1024 * 1024;  // 10 MB
+const MAX_RESPONSE_SIZE: u32 = 10 * 1024 * 1024; // 10 MB
+const RATE_LIMIT_PER_SECOND: u32 = 100;
+
 /// Shared context for all RPC methods
 #[derive(Clone)]
 pub struct RpcContext {
@@ -27,6 +37,40 @@ pub struct RpcContext {
     pub wallet: Option<Arc<RwLock<Wallet>>>,
     pub start_time: Instant,
     pub chain_id: [u8; 4],
+    pub rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+}
+
+impl RpcContext {
+    /// Create a new RPC context with rate limiting (SECURITY FIX: HIGH-NEW-003)
+    pub fn new(
+        db: NullaDb,
+        network_tx: Sender<NetworkCommand>,
+        wallet: Option<Arc<RwLock<Wallet>>>,
+        start_time: Instant,
+        chain_id: [u8; 4],
+    ) -> Self {
+        // Create rate limiter: 100 requests per second
+        let quota = Quota::per_second(NonZeroU32::new(RATE_LIMIT_PER_SECOND).unwrap());
+        let rate_limiter = Arc::new(RateLimiter::direct(quota));
+
+        Self {
+            db,
+            network_tx,
+            wallet,
+            start_time,
+            chain_id,
+            rate_limiter,
+        }
+    }
+
+    /// Check rate limit before processing request (SECURITY FIX: HIGH-NEW-003)
+    /// Returns Ok(()) if request is allowed, Err if rate limited
+    pub fn check_rate_limit(&self) -> Result<()> {
+        if self.rate_limiter.check().is_err() {
+            return Err(anyhow!("Rate limit exceeded. Maximum {} requests per second.", RATE_LIMIT_PER_SECOND));
+        }
+        Ok(())
+    }
 }
 
 /// Spawns the JSON-RPC 2.0 HTTP server
@@ -56,8 +100,11 @@ pub async fn spawn_rpc_server(
         ));
     }
 
-    // Build the server
+    // Build the server with security limits (SECURITY FIX: HIGH-NEW-003)
     let server = ServerBuilder::default()
+        .max_connections(MAX_CONNECTIONS)
+        .max_request_body_size(MAX_REQUEST_SIZE)
+        .max_response_body_size(MAX_RESPONSE_SIZE)
         .build(addr)
         .await
         .map_err(|e| anyhow!("Failed to build RPC server: {}", e))?;

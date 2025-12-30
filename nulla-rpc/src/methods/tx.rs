@@ -8,6 +8,9 @@ use nulla_net::NetworkCommand;
 /// Register transaction RPC methods
 pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()> {
     module.register_async_method("sendrawtransaction", |params, ctx| async move {
+        // SECURITY FIX (HIGH-AUD-001): Enforce rate limiting
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
         let hex: String = params.one()?;
 
         // Decode hex to transaction
@@ -46,8 +49,8 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
             )).into_error_object());
         }
 
-        // Add to mempool
-        ctx.db.put_mempool_tx(&tx)
+        // Add to mempool (signature validation now enforced in put_mempool_tx)
+        ctx.db.put_mempool_tx(&tx, &ctx.chain_id)
             .map_err(|e| RpcError::Mempool(e.to_string()).into_error_object())?;
 
         // Broadcast to network

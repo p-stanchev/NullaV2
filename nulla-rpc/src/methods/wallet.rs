@@ -7,6 +7,9 @@ use crate::RpcContext;
 /// Register wallet RPC methods
 pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()> {
     module.register_async_method("getwalletinfo", |_params, ctx| async move {
+        // SECURITY FIX (HIGH-AUD-001): Enforce rate limiting
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
         let wallet_lock = ctx.wallet.as_ref()
             .ok_or_else(|| RpcError::WalletNotLoaded.into_error_object())?;
 
@@ -34,6 +37,9 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
     })?;
 
     module.register_async_method("getnewaddress", |_params, ctx| async move {
+        // SECURITY FIX (HIGH-AUD-001): Enforce rate limiting
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
         let wallet_lock = ctx.wallet.as_ref()
             .ok_or_else(|| RpcError::WalletNotLoaded.into_error_object())?;
 

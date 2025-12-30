@@ -24,6 +24,9 @@ fn calculate_difficulty(target: &[u8; 32]) -> f64 {
 /// Register chain RPC methods
 pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()> {
     module.register_async_method("getbestblockhash", |_params, ctx| async move {
+        // SECURITY FIX (HIGH-AUD-001): Enforce rate limiting
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
         let tip = ctx.db.best_tip()
             .map_err(|e| RpcError::Database(e.to_string()).into_error_object())?
             .ok_or_else(|| RpcError::Internal("No tip found".to_string()).into_error_object())?;
@@ -31,6 +34,7 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
     })?;
 
     module.register_async_method("getblockcount", |_params, ctx| async move {
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
         let tip = ctx.db.best_tip()
             .map_err(|e| RpcError::Database(e.to_string()).into_error_object())?
             .ok_or_else(|| RpcError::Internal("No tip found".to_string()).into_error_object())?;
@@ -38,6 +42,7 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
     })?;
 
     module.register_async_method("getblockhash", |params, ctx| async move {
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
         let height: u64 = params.one()?;
         let header = ctx.db.get_header_by_height(height)
             .map_err(|e| RpcError::Database(e.to_string()).into_error_object())?
@@ -48,6 +53,7 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
     })?;
 
     module.register_async_method("getblockchaininfo", |_params, ctx| async move {
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
         let tip = ctx.db.best_tip()
             .map_err(|e| RpcError::Database(e.to_string()).into_error_object())?
             .ok_or_else(|| RpcError::Internal("No tip found".to_string()).into_error_object())?;
@@ -69,6 +75,7 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
     })?;
 
     module.register_async_method("getbalance", |params, ctx| async move {
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
         let address: String = params.one()?;
 
         // Decode address

@@ -26,3 +26,4 @@ libp2p.workspace = true
 chrono.workspace = true
 async-channel.workspace = true
 indicatif.workspace = true
+zeroize.workspace = true  # SECURITY: For securely clearing sensitive data (CRIT-NEW-002)

@@ -73,3 +73,8 @@ chrono = "0.4"
 
 # Progress bars
 indicatif = "0.17"
+
+# Security fixes (Phase 3)
+num-bigint = "0.4"  # For safe difficulty calculation (CRIT-NEW-004)
+num-traits = "0.2"  # For BigUint traits
+governor = "0.6"    # For RPC rate limiting (HIGH-NEW-003)
