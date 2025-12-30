@@ -444,6 +444,106 @@ pub const MAX_BLOCK_SIZE: usize = 4_000_000;
 /// This prevents miners from spending rewards from blocks that might be orphaned.
 pub const COINBASE_MATURITY: u64 = 100;
 
+/// Emission schedule constants (Monero-style with tail emission).
+///
+/// Economic Model:
+/// - Initial reward: 8 NULLA per block
+/// - Halving interval: Every 525,600 blocks (~2 years at 2 min/block)
+/// - Total halvings: 20 halvings over ~40 years
+/// - Main emission: ~83.9M NULLA over 40 years
+/// - Tail emission: 0.6 NULLA/block forever after main emission
+/// - This ensures long-term miner incentives without hard supply cap
+pub mod emission {
+    /// Atoms per NULLA (100 million, like Bitcoin satoshis).
+    pub const ATOMS_PER_NULLA: u64 = 100_000_000;
+
+    /// Initial block reward in atoms (8 NULLA).
+    pub const INITIAL_REWARD_ATOMS: u64 = 8 * ATOMS_PER_NULLA;
+
+    /// Halving interval in blocks (525,600 blocks = ~2 years at 2 min/block).
+    /// 525,600 blocks * 120 seconds = 63,072,000 seconds = 730 days
+    pub const HALVING_INTERVAL: u64 = 525_600;
+
+    /// Number of halvings before tail emission starts (20 halvings = ~40 years).
+    pub const MAX_HALVINGS: u32 = 20;
+
+    /// Tail emission in atoms (0.6 NULLA per block).
+    /// This ensures perpetual block rewards for long-term security.
+    /// Annual inflation rate with tail emission: ~0.87% decreasing over time.
+    pub const TAIL_EMISSION_ATOMS: u64 = 60_000_000; // 0.6 NULLA
+
+    /// Calculate total supply at a given block height (approximation).
+    ///
+    /// Formula:
+    /// - During main emission (height < HALVING_INTERVAL * MAX_HALVINGS):
+    ///   Sum of geometric series: initial * interval * (1 - 0.5^halvings) / 0.5
+    /// - After main emission:
+    ///   Main emission total + (blocks_after * TAIL_EMISSION)
+    pub fn total_supply(height: u64) -> u64 {
+        let main_emission_end = HALVING_INTERVAL * MAX_HALVINGS as u64;
+
+        if height <= main_emission_end {
+            // During main emission - sum rewards from all completed halvings
+            let mut total = 0u64;
+            let mut remaining_height = height;
+            let mut current_reward = INITIAL_REWARD_ATOMS;
+
+            while remaining_height > 0 && current_reward > TAIL_EMISSION_ATOMS {
+                let blocks_at_this_level = remaining_height.min(HALVING_INTERVAL);
+                total = total.saturating_add(blocks_at_this_level.saturating_mul(current_reward));
+                remaining_height = remaining_height.saturating_sub(HALVING_INTERVAL);
+                current_reward /= 2;
+            }
+
+            total
+        } else {
+            // After main emission - calculate main total + tail emission
+            // Main emission total: ~83.9M NULLA
+            let mut main_total = 0u64;
+            let mut current_reward = INITIAL_REWARD_ATOMS;
+
+            for _ in 0..MAX_HALVINGS {
+                main_total = main_total.saturating_add(HALVING_INTERVAL.saturating_mul(current_reward));
+                current_reward /= 2;
+            }
+
+            // Add tail emission for blocks after main emission
+            let blocks_after = height.saturating_sub(main_emission_end);
+            main_total.saturating_add(blocks_after.saturating_mul(TAIL_EMISSION_ATOMS))
+        }
+    }
+}
+
+/// Calculate block reward at given height using halving schedule.
+///
+/// Emission Schedule:
+/// - Blocks 0-525,599: 8 NULLA per block
+/// - Blocks 525,600-1,051,199: 4 NULLA per block
+/// - Blocks 1,051,200-1,576,799: 2 NULLA per block
+/// - ... (continues halving every 525,600 blocks)
+/// - After 20 halvings (~40 years): 0.6 NULLA per block (tail emission)
+///
+/// Returns reward in atoms.
+pub fn calculate_block_reward(height: u64) -> u64 {
+    let halvings = height / emission::HALVING_INTERVAL;
+
+    if halvings >= emission::MAX_HALVINGS as u64 {
+        // Tail emission phase
+        emission::TAIL_EMISSION_ATOMS
+    } else {
+        // Main emission phase - halve reward for each period
+        let mut reward = emission::INITIAL_REWARD_ATOMS;
+        for _ in 0..halvings {
+            reward /= 2;
+            // Stop if reward drops below tail emission
+            if reward < emission::TAIL_EMISSION_ATOMS {
+                return emission::TAIL_EMISSION_ATOMS;
+            }
+        }
+        reward
+    }
+}
+
 /// Hardcoded blockchain checkpoints for security (HIGH-012).
 /// These prevent attackers from feeding fake chains during initial sync.
 /// Format: (block_height, block_hash)

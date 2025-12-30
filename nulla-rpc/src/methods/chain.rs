@@ -64,6 +64,11 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
 
         let difficulty = calculate_difficulty(&header.target);
 
+        // Calculate current supply based on height
+        let current_height = tip.1;
+        let total_supply_atoms = nulla_core::emission::total_supply(current_height);
+        let current_reward_atoms = nulla_core::calculate_block_reward(current_height);
+
         Ok::<BlockchainInfo, jsonrpsee::types::ErrorObjectOwned>(BlockchainInfo {
             chain: "nulla".to_string(),
             blocks: tip.1,
@@ -71,6 +76,40 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
             bestblockhash: hex::encode(tip.0),
             difficulty,
             mediantime: header.timestamp,
+            total_supply: total_supply_atoms as f64 / nulla_core::emission::ATOMS_PER_NULLA as f64,
+            current_reward: current_reward_atoms as f64 / nulla_core::emission::ATOMS_PER_NULLA as f64,
+        })
+    })?;
+
+    module.register_async_method("getemissioninfo", |params, ctx| async move {
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
+        // Optional height parameter (defaults to current height)
+        let query_height: u64 = match params.one::<u64>() {
+            Ok(h) => h,
+            Err(_) => {
+                // No parameter provided, use current height
+                ctx.db.best_tip()
+                    .map_err(|e| RpcError::Database(e.to_string()).into_error_object())?
+                    .ok_or_else(|| RpcError::Internal("No tip found".to_string()).into_error_object())?
+                    .1
+            }
+        };
+
+        let reward_atoms = nulla_core::calculate_block_reward(query_height);
+        let supply_atoms = nulla_core::emission::total_supply(query_height);
+        let halvings = query_height / nulla_core::emission::HALVING_INTERVAL;
+        let blocks_until_next_halving = nulla_core::emission::HALVING_INTERVAL - (query_height % nulla_core::emission::HALVING_INTERVAL);
+        let is_tail_emission = halvings >= nulla_core::emission::MAX_HALVINGS as u64;
+
+        Ok::<EmissionInfo, jsonrpsee::types::ErrorObjectOwned>(EmissionInfo {
+            height: query_height,
+            reward: reward_atoms as f64 / nulla_core::emission::ATOMS_PER_NULLA as f64,
+            supply: supply_atoms as f64 / nulla_core::emission::ATOMS_PER_NULLA as f64,
+            halvings: halvings as u32,
+            blocks_until_next_halving: if is_tail_emission { 0 } else { blocks_until_next_halving },
+            tail_emission: is_tail_emission,
+            tail_emission_rate: nulla_core::emission::TAIL_EMISSION_ATOMS as f64 / nulla_core::emission::ATOMS_PER_NULLA as f64,
         })
     })?;
 

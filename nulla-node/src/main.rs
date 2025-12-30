@@ -25,6 +25,13 @@ use tracing_subscriber::FmtSubscriber;
 /// Bitcoin uses ~6 blocks for finality; 100 blocks provides ample safety margin.
 const MAX_REORG_DEPTH: usize = 100;
 
+/// Hardcoded bootstrap seed nodes.
+/// These nodes are always added to the peer list to help new nodes join the network.
+/// Users can add additional peers via --peers flag.
+const BOOTSTRAP_SEEDS: &[&str] = &[
+    "/ip4/45.155.53.102/tcp/27444", // Primary seed node (EU)
+];
+
 /// Command-line arguments for the Nulla node.
 #[derive(Parser, Debug)]
 #[command(name = "nulla", about = "Nulla minimal node", version)]
@@ -590,10 +597,13 @@ async fn main() -> Result<()> {
         // Setup networking to broadcast the transaction.
         let chain_id = chain_id_bytes(&args.chain_id);
         let listen_addrs = parse_multiaddrs(&args.listen)?;
-        let peer_addrs = parse_multiaddrs(&args.peers)?;
+        let user_peers = parse_multiaddrs(&args.peers)?;
+
+        // Merge user peers with hardcoded bootstrap seeds and deduplicate
+        let peer_addrs = merge_peers_with_bootstrap(user_peers);
 
         if peer_addrs.is_empty() {
-            eprintln!("\nError: No peers configured!");
+            eprintln!("\nError: No peers configured and bootstrap seeds unavailable!");
             eprintln!("Transaction created but NOT broadcasted (no peers online).");
             eprintln!("The transaction is saved in the local mempool.");
             eprintln!("To broadcast, restart the node with --peers to connect to the network.");
@@ -771,7 +781,10 @@ async fn main() -> Result<()> {
 
     // Parse multiaddresses for listening and peer connections.
     let listen_addrs = parse_multiaddrs(&args.listen)?;
-    let peer_addrs = parse_multiaddrs(&args.peers)?;
+    let user_peers = parse_multiaddrs(&args.peers)?;
+
+    // Merge user peers with hardcoded bootstrap seeds and deduplicate
+    let peer_addrs = merge_peers_with_bootstrap(user_peers);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -919,6 +932,37 @@ fn parse_multiaddrs(list: &[String]) -> Result<Vec<libp2p::Multiaddr>> {
         .map(|s| libp2p::Multiaddr::from_str(s))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Merge user-provided peers with hardcoded bootstrap seeds and remove duplicates.
+fn merge_peers_with_bootstrap(user_peers: Vec<libp2p::Multiaddr>) -> Vec<libp2p::Multiaddr> {
+    use std::collections::HashSet;
+
+    let mut peer_set = HashSet::new();
+    let mut final_peers = Vec::new();
+
+    // Add hardcoded bootstrap seeds first
+    for seed in BOOTSTRAP_SEEDS {
+        if let Ok(addr) = libp2p::Multiaddr::from_str(seed) {
+            let addr_str = addr.to_string();
+            if peer_set.insert(addr_str) {
+                final_peers.push(addr);
+                info!("bootstrap seed: {}", seed);
+            }
+        }
+    }
+
+    // Add user-provided peers (skip duplicates)
+    for addr in user_peers {
+        let addr_str = addr.to_string();
+        if peer_set.insert(addr_str) {
+            final_peers.push(addr);
+        } else {
+            debug!("duplicate peer address skipped: {}", addr);
+        }
+    }
+
+    final_peers
 }
 
 /// Handle network events and respond to requests.
@@ -1515,15 +1559,18 @@ async fn process_full_block(
         }
     };
 
+    // Calculate block reward based on height (emission schedule with tail emission)
+    let block_reward = nulla_core::calculate_block_reward(block.header.height);
+
     // Validate coinbase doesn't claim more than block_reward + total_fees
     if let Err(e) = nulla_core::validate_coinbase(
         &block.txs[0],
-        nulla_wallet::BLOCK_REWARD_ATOMS,
+        block_reward,
         total_fees,
     ) {
         warn!(
-            "block rejected: coinbase validation failed (reward: {}, fees: {}, error: {})",
-            nulla_wallet::BLOCK_REWARD_ATOMS, total_fees, e
+            "block rejected: coinbase validation failed (height: {}, reward: {}, fees: {}, error: {})",
+            block.header.height, block_reward, total_fees, e
         );
         return;
     }
@@ -1964,13 +2011,16 @@ fn spawn_miner_real(
                 prev_height + 1
             };
 
+            // Calculate block reward based on height (emission schedule with tail emission)
+            let block_reward = nulla_core::calculate_block_reward(next_height);
+
             // Create coinbase transaction if we have a wallet
             use nulla_core::{Block, Tx};
             let mut txs: Vec<Tx> = if let Some(addr) = coinbase_addr {
                 vec![nulla_wallet::create_coinbase(
                     &addr,
                     next_height,
-                    nulla_wallet::BLOCK_REWARD_ATOMS,
+                    block_reward,
                 )]
             } else {
                 // Create a dummy coinbase with no outputs (for testing without wallet)
@@ -1982,7 +2032,7 @@ fn spawn_miner_real(
                         pubkey: vec![], // Coinbase doesn't need a public key
                     }],
                     outputs: vec![nulla_core::TxOut {
-                        value_atoms: nulla_wallet::BLOCK_REWARD_ATOMS,
+                        value_atoms: block_reward,
                         script_pubkey: vec![0x00; 25], // Dummy script
                     }],
                     lock_time: 0,
@@ -2171,7 +2221,7 @@ fn spawn_miner_real(
                 next_height,
                 hex::encode(block_id),
                 cumulative_work,
-                nulla_wallet::atoms_to_nulla(nulla_wallet::BLOCK_REWARD_ATOMS)
+                nulla_wallet::atoms_to_nulla(block_reward)
             );
 
             // Validate and apply all transactions atomically (SECURITY FIX: CRIT-006)

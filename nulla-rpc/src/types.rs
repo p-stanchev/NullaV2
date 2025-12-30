@@ -9,6 +9,20 @@ pub struct BlockchainInfo {
     pub bestblockhash: String,
     pub difficulty: f64,
     pub mediantime: u64,
+    pub total_supply: f64,
+    pub current_reward: f64,
+}
+
+/// Emission schedule information response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmissionInfo {
+    pub height: u64,
+    pub reward: f64,
+    pub supply: f64,
+    pub halvings: u32,
+    pub blocks_until_next_halving: u64,
+    pub tail_emission: bool,
+    pub tail_emission_rate: f64,
 }
 
 /// Mempool information response
