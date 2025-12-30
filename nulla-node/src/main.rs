@@ -17,7 +17,7 @@ use nulla_net::{self, protocol, NetConfig, NetworkCommand, NetworkEvent};
 use nulla_wallet::Wallet;
 use tokio::signal;
 use tokio::sync::Mutex;
-use tracing::{info, warn, Level};
+use tracing::{debug, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 /// Maximum depth for chain reorganizations (SECURITY FIX: HIGH-NEW-002).
@@ -791,6 +791,9 @@ async fn main() -> Result<()> {
 
     // Store network command channel outside the if block for RPC access
     let cmd_tx = if gossip_enabled {
+        // Clone peer_addrs before moving it into NetConfig
+        let peer_addrs_for_sync = peer_addrs.clone();
+
         let net_cfg = NetConfig {
             chain_id,
             listen: listen_addrs,
@@ -817,8 +820,8 @@ async fn main() -> Result<()> {
             chain_id,
         ));
 
-        // Spawn periodic peer sync task
-        tokio::spawn(periodic_peer_sync(cmd_tx.clone(), db.clone()));
+        // Spawn periodic peer sync task with peer list for reconnection
+        tokio::spawn(periodic_peer_sync(cmd_tx.clone(), db.clone(), peer_addrs_for_sync));
 
         // If seed mode is enabled, spawn the seed node (relay/sync only).
         if args.seed {
@@ -1148,7 +1151,15 @@ async fn handle_network_events(
                 process_full_block(&db, &sync_progress, block, Some(from), &chain_id).await;
             }
             NetworkEvent::Request { peer, req, channel } => {
-                info!("request from {peer:?}: {:?}", req);
+                // Only log GetHeaders and GetBlock requests at debug level to reduce clutter during sync
+                match &req {
+                    protocol::Req::GetHeaders { .. } | protocol::Req::GetBlock { .. } => {
+                        debug!("request from {peer:?}: {:?}", req);
+                    }
+                    _ => {
+                        info!("request from {peer:?}: {:?}", req);
+                    }
+                }
                 // Handle the request and send a response.
                 let resp = handle_request(&db, req);
                 let _ = cmd_tx
@@ -1156,7 +1167,15 @@ async fn handle_network_events(
                     .await;
             }
             NetworkEvent::Response { peer, resp } => {
-                info!("response from {peer:?}: {:?}", resp);
+                // Only log Headers and Block responses at debug level to reduce clutter during sync
+                match &resp {
+                    protocol::Resp::Headers { .. } | protocol::Resp::Block { .. } => {
+                        debug!("response from {peer:?}: {:?}", resp);
+                    }
+                    _ => {
+                        info!("response from {peer:?}: {:?}", resp);
+                    }
+                }
 
                 // Handle mempool sync for all nodes (not just seed mode)
                 if let protocol::Resp::Mempool { txs } = &resp {
@@ -1704,9 +1723,22 @@ fn handle_request(db: &NullaDb, req: protocol::Req) -> protocol::Resp {
 /// Every 60 seconds, this task:
 /// - Logs current chain state
 /// - Ensures peers are kept in sync via gossipsub
-async fn periodic_peer_sync(_cmd_tx: async_channel::Sender<NetworkCommand>, db: NullaDb) {
+async fn periodic_peer_sync(
+    cmd_tx: async_channel::Sender<NetworkCommand>,
+    db: NullaDb,
+    peers: Vec<libp2p::Multiaddr>,
+) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+        // Attempt to dial all peers to maintain connections and discover new peers
+        if !peers.is_empty() {
+            info!("attempting to dial {} peer(s) to maintain connectivity", peers.len());
+            for peer in &peers {
+                debug!("dialing peer: {}", peer);
+                let _ = cmd_tx.send(NetworkCommand::Dial(peer.clone())).await;
+            }
+        }
 
         // Log current chain state for monitoring
         match db.best_tip() {
