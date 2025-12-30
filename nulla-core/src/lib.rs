@@ -544,6 +544,152 @@ pub fn calculate_block_reward(height: u64) -> u64 {
     }
 }
 
+/// Soft fork activation system (BIP9-style version bits).
+///
+/// Allows coordinated protocol upgrades by signaling readiness in block versions.
+///
+/// How it works:
+/// 1. Define a deployment with start/timeout heights and bit position
+/// 2. Miners signal readiness by setting the bit in block version
+/// 3. If 95% of blocks in a 2016-block period signal, fork activates
+/// 4. After activation, new rules are enforced
+pub mod softfork {
+    /// Soft fork deployment states
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DeploymentState {
+        /// Deployment not yet started
+        Defined,
+        /// Actively signaling, waiting for threshold
+        Started,
+        /// Threshold reached, rules will activate
+        LockedIn,
+        /// Rules are now active and enforced
+        Active,
+        /// Timeout reached without activation
+        Failed,
+    }
+
+    /// Soft fork deployment configuration
+    #[derive(Debug, Clone, Copy)]
+    pub struct Deployment {
+        /// Human-readable name
+        pub name: &'static str,
+        /// Bit position in version field (0-15)
+        pub bit: u8,
+        /// Height at which signaling starts
+        pub start_height: u64,
+        /// Height at which deployment times out if not activated
+        pub timeout_height: u64,
+        /// Threshold for activation (blocks signaling / total blocks in period)
+        /// Default: 1916 out of 2016 blocks (95%)
+        pub threshold: u32,
+        /// Number of blocks in a signaling period
+        /// Default: 2016 blocks (~4 weeks at 2 min/block)
+        pub period: u32,
+    }
+
+    impl Deployment {
+        /// Check if this deployment is signaling in the given block version
+        pub fn is_signaling(&self, version: u16) -> bool {
+            (version & (1 << self.bit)) != 0
+        }
+
+        /// Get deployment state at given height with signaling history
+        pub fn get_state(
+            &self,
+            height: u64,
+            signaling_blocks: u32,
+        ) -> DeploymentState {
+            if height < self.start_height {
+                return DeploymentState::Defined;
+            }
+
+            if height >= self.timeout_height {
+                // Check if we activated before timeout
+                if signaling_blocks >= self.threshold {
+                    return DeploymentState::Active;
+                }
+                return DeploymentState::Failed;
+            }
+
+            // We're between start and timeout
+            if signaling_blocks >= self.threshold {
+                return DeploymentState::LockedIn;
+            }
+
+            DeploymentState::Started
+        }
+    }
+
+    /// Define active soft fork deployments
+    ///
+    /// Example deployment:
+    /// ```
+    /// pub const EXAMPLE_FORK: Deployment = Deployment {
+    ///     name: "timelock_opcodes",
+    ///     bit: 0,
+    ///     start_height: 100_000,
+    ///     timeout_height: 200_000,
+    ///     threshold: 1916,  // 95% of 2016
+    ///     period: 2016,
+    /// };
+    /// ```
+    pub const DEPLOYMENTS: &[Deployment] = &[
+        // Add future soft fork deployments here
+        // Deployment {
+        //     name: "timelock_opcodes",
+        //     bit: 0,
+        //     start_height: 525_600,  // After first halving (~2 years)
+        //     timeout_height: 1_051_200, // 2 years to activate
+        //     threshold: 1916,        // 95% of 2016
+        //     period: 2016,
+        // },
+    ];
+
+    /// Check if a specific soft fork is active at given height
+    pub fn is_active(deployment_name: &str, height: u64, signaling_blocks: u32) -> bool {
+        for deployment in DEPLOYMENTS {
+            if deployment.name == deployment_name {
+                let state = deployment.get_state(height, signaling_blocks);
+                return state == DeploymentState::Active || state == DeploymentState::LockedIn;
+            }
+        }
+        false
+    }
+
+    /// Calculate signaling blocks in the current period
+    ///
+    /// This should be called by nodes to track signaling progress.
+    /// Returns the number of blocks signaling for a deployment in the current period.
+    pub fn count_signaling_blocks<F>(
+        deployment: &Deployment,
+        current_height: u64,
+        get_block_version: F,
+    ) -> u32
+    where
+        F: Fn(u64) -> Option<u16>,
+    {
+        if current_height < deployment.start_height {
+            return 0;
+        }
+
+        // Calculate period start
+        let period_start = (current_height / deployment.period as u64) * deployment.period as u64;
+        let period_start = period_start.max(deployment.start_height);
+
+        let mut count = 0;
+        for h in period_start..=current_height {
+            if let Some(version) = get_block_version(h) {
+                if deployment.is_signaling(version) {
+                    count += 1;
+                }
+            }
+        }
+
+        count
+    }
+}
+
 /// Hardcoded blockchain checkpoints for security (HIGH-012).
 /// These prevent attackers from feeding fake chains during initial sync.
 /// Format: (block_height, block_hash)

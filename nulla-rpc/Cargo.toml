@@ -8,6 +8,7 @@ nulla-core = { path = "../nulla-core" }
 nulla-db = { path = "../nulla-db" }
 nulla-wallet = { path = "../nulla-wallet" }
 nulla-net = { path = "../nulla-net" }
+nulla-electrum = { path = "../nulla-electrum" }
 jsonrpsee.workspace = true
 tokio.workspace = true
 serde.workspace = true

@@ -194,6 +194,16 @@ struct Args {
     /// Amount to send in NULLA (e.g., 5.0 = 500000000 atoms).
     #[arg(long)]
     amount: Option<f64>,
+
+    /// Enable pruning mode to reduce disk usage (discards old block data, keeps headers + UTXO set).
+    /// Full nodes keep all blocks; pruned nodes only keep recent blocks.
+    #[arg(long, default_value_t = false)]
+    prune: bool,
+
+    /// Number of recent blocks to keep when pruning (default: 550 = ~1 week).
+    /// Must be >= 100 for safe chain reorganizations.
+    #[arg(long, default_value_t = 550)]
+    prune_keep_blocks: u64,
 }
 
 #[tokio::main]
@@ -776,8 +786,18 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Configure pruning if enabled.
+    let pruning_config = nulla_db::PruningConfig {
+        enabled: args.prune,
+        keep_blocks: args.prune_keep_blocks,
+    };
+
     // Open the database for blocks, headers, UTXOs, and mempool.
-    let db = NullaDb::open(&args.db)?;
+    let db = NullaDb::open_with_pruning(&args.db, pruning_config)?;
+
+    if args.prune {
+        info!("pruning mode enabled (keeping {} recent blocks)", args.prune_keep_blocks);
+    }
 
     // Parse multiaddresses for listening and peer connections.
     let listen_addrs = parse_multiaddrs(&args.listen)?;
@@ -1613,6 +1633,11 @@ async fn process_full_block(
                         block.header.height, cumulative_work
                     );
 
+                    // Prune old blocks if pruning is enabled
+                    if let Err(e) = db.prune_old_blocks() {
+                        warn!("pruning failed: {e}");
+                    }
+
                     let mut progress_lock = sync_progress.lock().await;
                     if let Some(ref pb) = *progress_lock {
                         pb.set_position(block.header.height);
@@ -1643,6 +1668,11 @@ async fn process_full_block(
                         "switched to new best chain at height {} after reorg",
                         block.header.height
                     );
+
+                    // Prune old blocks if pruning is enabled
+                    if let Err(e) = db.prune_old_blocks() {
+                        warn!("pruning failed: {e}");
+                    }
                 }
             } else if block.header.height > tip_height {
                 let blocks_behind = block.header.height - tip_height;
@@ -2259,6 +2289,11 @@ fn spawn_miner_real(
                 if let Err(e) = db.remove_mempool_tx(&txid) {
                     warn!("miner: failed to remove tx {} from mempool: {e}", i);
                 }
+            }
+
+            // Prune old blocks if pruning is enabled
+            if let Err(e) = db.prune_old_blocks() {
+                warn!("miner: pruning failed: {e}");
             }
 
             // Broadcast the full block to the network (includes transactions).

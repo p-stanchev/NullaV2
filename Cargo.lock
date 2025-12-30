@@ -2555,6 +2555,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nulla-electrum"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "blake3",
+ "hex",
+ "nulla-core",
+ "nulla-db",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nulla-net"
 version = "0.1.0"
 dependencies = [
@@ -2612,6 +2629,7 @@ dependencies = [
  "jsonrpsee",
  "nulla-core",
  "nulla-db",
+ "nulla-electrum",
  "nulla-net",
  "nulla-wallet",
  "serde",

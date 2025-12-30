@@ -130,5 +130,27 @@ pub fn register_methods(module: &mut RpcModule<RpcContext>) -> anyhow::Result<()
         Ok::<u64, jsonrpsee::types::ErrorObjectOwned>(balance)
     })?;
 
+    module.register_async_method("getpruninginfo", |_params, ctx| async move {
+        ctx.check_rate_limit().map_err(|e| RpcError::TooManyRequests(e.to_string()).into_error_object())?;
+
+        let config = ctx.db.pruning_config();
+        let (_tip, current_height, _work) = ctx.db.best_tip()
+            .map_err(|e| RpcError::Database(e.to_string()).into_error_object())?
+            .unwrap_or(([0u8; 32], 0, 0));
+
+        let prune_height = if config.enabled && current_height > config.keep_blocks {
+            current_height - config.keep_blocks
+        } else {
+            0
+        };
+
+        Ok::<PruningInfo, jsonrpsee::types::ErrorObjectOwned>(PruningInfo {
+            enabled: config.enabled,
+            keep_blocks: config.keep_blocks,
+            prune_height,
+            current_height,
+        })
+    })?;
+
     Ok(())
 }

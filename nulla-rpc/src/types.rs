@@ -166,3 +166,12 @@ pub struct PeerInfo {
     pub synced_headers: u64,
     pub synced_blocks: u64,
 }
+
+/// Pruning mode information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PruningInfo {
+    pub enabled: bool,
+    pub keep_blocks: u64,
+    pub prune_height: u64,
+    pub current_height: u64,
+}

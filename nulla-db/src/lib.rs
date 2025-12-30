@@ -56,6 +56,25 @@ pub enum DbError {
 /// Result type for database operations.
 pub type Result<T> = std::result::Result<T, DbError>;
 
+/// Pruning configuration for blockchain storage optimization.
+#[derive(Debug, Clone, Copy)]
+pub struct PruningConfig {
+    /// Enable pruning mode (discard old block data).
+    pub enabled: bool,
+    /// Number of blocks to keep before pruning (default: 550 for ~1 week of blocks).
+    /// Must be >= MAX_REORG_DEPTH (100) to allow safe chain reorganizations.
+    pub keep_blocks: u64,
+}
+
+impl Default for PruningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keep_blocks: 550, // ~1 week of blocks at 10min/block
+        }
+    }
+}
+
 /// Database handle for accessing blockchain state.
 ///
 /// Sled's Db and Tree types are internally Arc-wrapped, so cloning is cheap.
@@ -85,11 +104,27 @@ pub struct NullaDb {
     /// Spent UTXO backup for reorg restoration (maps OutPoint -> TxOut).
     /// Stores the original UTXO data when an output is spent, allowing proper restoration during chain reorgs.
     spent_utxos: Tree,
+    /// Pruning configuration.
+    pruning: PruningConfig,
 }
 
 impl NullaDb {
     /// Open or create a database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_pruning(path, PruningConfig::default())
+    }
+
+    /// Open or create a database with custom pruning configuration.
+    pub fn open_with_pruning(path: impl AsRef<Path>, pruning: PruningConfig) -> Result<Self> {
+        // SECURITY: Ensure keep_blocks is sufficient for reorg safety
+        if pruning.enabled && pruning.keep_blocks < 100 {
+            return Err(DbError::Serde(bincode::Error::new(
+                bincode::ErrorKind::Custom(
+                    "Pruning keep_blocks must be at least 100 for reorg safety".to_string()
+                )
+            )));
+        }
+
         let db = Config::default().path(path).open()?;
         Ok(Self {
             meta: db.open_tree("meta")?,
@@ -103,8 +138,75 @@ impl NullaDb {
             utxo_by_addr: db.open_tree("utxo_by_addr")?,
             coinbase_heights: db.open_tree("coinbase_heights")?,
             spent_utxos: db.open_tree("spent_utxos")?,
+            pruning,
             _db: db,
         })
+    }
+
+    /// Get the current pruning configuration.
+    pub fn pruning_config(&self) -> PruningConfig {
+        self.pruning
+    }
+
+    /// Check if a block at the given height has been pruned.
+    /// Returns true if the block data is discarded but header remains.
+    pub fn is_block_pruned(&self, height: u64) -> Result<bool> {
+        if !self.pruning.enabled {
+            return Ok(false);
+        }
+
+        let (_tip, current_height, _work) = match self.best_tip()? {
+            Some(tip) => tip,
+            None => return Ok(false),
+        };
+
+        // Block is pruned if it's older than keep_blocks threshold
+        Ok(height + self.pruning.keep_blocks < current_height)
+    }
+
+    /// Prune old block data while keeping headers and recent blocks.
+    /// This is called automatically after new blocks are added if pruning is enabled.
+    ///
+    /// Returns the number of blocks pruned.
+    pub fn prune_old_blocks(&self) -> Result<usize> {
+        if !self.pruning.enabled {
+            return Ok(0);
+        }
+
+        let (_tip, current_height, _work) = match self.best_tip()? {
+            Some(tip) => tip,
+            None => return Ok(0),
+        };
+
+        // Calculate pruning threshold height
+        let prune_below_height = if current_height > self.pruning.keep_blocks {
+            current_height - self.pruning.keep_blocks
+        } else {
+            return Ok(0); // Not enough blocks to prune yet
+        };
+
+        let mut pruned_count = 0;
+
+        // Iterate through old blocks and remove block data (keep headers)
+        for height in 0..prune_below_height {
+            if let Some(id_bytes) = self.header_by_height.get(&height.to_be_bytes())? {
+                let mut block_id = [0u8; 32];
+                block_id.copy_from_slice(&id_bytes);
+
+                // Only prune if block data exists (not already pruned)
+                if self.blocks.contains_key(&block_id)? {
+                    self.blocks.remove(&block_id)?;
+                    pruned_count += 1;
+                }
+            }
+        }
+
+        if pruned_count > 0 {
+            tracing::info!("Pruned {} old blocks (keeping blocks >= height {})",
+                pruned_count, prune_below_height);
+        }
+
+        Ok(pruned_count)
     }
 
     /// Update the best tip (highest cumulative work chain).
