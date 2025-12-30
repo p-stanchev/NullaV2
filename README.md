@@ -99,6 +99,70 @@ cargo run -p nulla-node -- --peers /ip4/127.0.0.1/tcp/27444 --db ./data2
 
 The nodes will connect, exchange peer information, and gossip blocks/transactions.
 
+### Connecting to Remote Nodes
+
+To connect your node to a remote peer (like a VPS or another computer), use the `--peers` flag with the IP address and port.
+
+**Multiaddr Format:**
+```
+/ip4/<IP_ADDRESS>/tcp/<PORT>
+```
+
+**Examples:**
+
+**Windows - Connect to VPS:**
+```powershell
+# Development mode
+cargo run -p nulla-node -- --peers /ip4/45.155.53.102/tcp/27444 --gossip
+
+# Release mode
+.\target\release\nulla.exe --peers /ip4/45.155.53.102/tcp/27444 --gossip
+```
+
+**Linux/macOS - Connect to VPS:**
+```bash
+# Development mode
+cargo run -p nulla-node -- --peers /ip4/45.155.53.102/tcp/27444 --gossip
+
+# Release mode
+./target/release/nulla --peers /ip4/45.155.53.102/tcp/27444 --gossip
+```
+
+**Connect to Multiple Peers:**
+```bash
+# Specify multiple --peers flags
+nulla --peers /ip4/45.155.53.102/tcp/27444 --peers /ip4/192.168.1.100/tcp/27444 --gossip
+```
+
+**What you'll see when connected:**
+```
+INFO local peer id 12D3KooWPo36V3FbG8DMKAw3uWDfP4kqjnX4QqqcwzdWdZSU2hEy
+INFO bootstrapping Kademlia DHT with 1 initial peer(s)
+INFO peer connected 12D3KooWMy7A4jFv31Qg1ovdngbBeyLJu4zF2JR9z8nJjpH8KnjY
+INFO attempting to dial 1 peer(s) to maintain connectivity
+[00:01:23] =========>------------- 150/500 blocks (00:02:15)
+```
+
+**Common Connection Issues:**
+
+1. **Firewall blocking:** Make sure port 27444 is open on your VPS
+   ```bash
+   # Linux - Open port with ufw
+   sudo ufw allow 27444/tcp
+   ```
+
+2. **Wrong IP address:** Make sure you're using the correct public IP of your VPS
+   ```bash
+   # Check VPS public IP
+   curl ifconfig.me
+   ```
+
+3. **Node not listening:** The remote node must use `--listen` to accept connections
+   ```bash
+   # VPS must run with --listen
+   nulla --mine --listen /ip4/0.0.0.0/tcp/27444
+   ```
+
 ### Enabling Seed Mode
 
 To create blocks that properly build a chain (with incrementing height):
@@ -394,6 +458,46 @@ INFO sync tick: height=150 tip=a1b2c3d4 work=5000000 mempool=0
 - ✅  Local needs `--peers` with VPS IP address
 - ✅  Use `--miner-address` (public) NOT `--wallet-seed` (private)
 - ℹ️  `--seed` mode is for relay nodes (no mining, no rewards) - use `--mine` for earning
+
+### What Happens When Two Miners Find a Block Simultaneously?
+
+Nulla uses **Nakamoto Consensus** (same as Bitcoin) to handle competing blocks:
+
+**Scenario: Two miners find block 100 at the same time**
+
+1. **Both blocks are broadcast** to the network
+2. **Network temporarily forks** - some nodes see Block A first, others see Block B
+3. **Miners continue on their chain** - trying to find block 101
+4. **First to find block 101 wins** - their chain now has more cumulative proof-of-work
+5. **Automatic reorganization** - all nodes switch to the chain with most work
+6. **Losing block is orphaned** - discarded and its transactions return to mempool
+
+**Example:**
+```
+Chain A: Block 100a → Block 101a ✅ (More work - this wins!)
+Chain B: Block 100b ❌ (Less work - orphaned)
+```
+
+**What you'll see in logs:**
+```
+INFO received chain with more work (our: 5000, theirs: 5100), height: 101
+INFO triggering chain reorganization
+INFO   reverting 1 blocks from old chain
+INFO   applied 2 blocks from new chain
+INFO chain reorganization complete
+INFO switched to new best chain at height 101 after reorg
+```
+
+**Important for Miners:**
+- ⚠️  Your mined block might get orphaned if another miner finds block 101 first
+- ⚠️  You'll lose the block reward if your block is orphaned
+- ✅  **Wait for 6+ confirmations** before considering rewards "final"
+- ✅  This is normal blockchain behavior - prevents double-spending
+
+**Security Protections:**
+- Maximum reorg depth: 100 blocks (prevents DoS attacks)
+- Reorgs deeper than 100 blocks are automatically rejected
+- Network always converges on the chain with most cumulative proof-of-work
 
 #### When to Use Seed Mode (`--seed`)
 

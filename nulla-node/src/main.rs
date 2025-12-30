@@ -1859,6 +1859,71 @@ fn spawn_miner_real(
             warn!("miner: no address provided, blocks will have dummy coinbase (no real rewards)");
         }
 
+        // Wait for initial peer connection before mining (prevents creating competing genesis chains)
+        info!("miner: waiting up to 10 minutes for peer connection before mining...");
+
+        let mut sync_started = false;
+        let mut last_height = 0u64;
+        let mut stable_count = 0u8;
+
+        // Wait in 1-second intervals so we can check for shutdown
+        // 10 minutes = 600 seconds = 10 attempts at 60-second peer dial interval
+        for i in 0..600 {
+            if shutdown.load(Ordering::Relaxed) {
+                info!("miner: shutdown requested during initial wait");
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+            // Check every 2 seconds if we've synced blocks
+            if i > 0 && i % 2 == 0 {
+                // Check if we have any blocks from the network
+                if let Ok(Some((_, height, _))) = db.best_tip() {
+                    if height > 0 {
+                        if !sync_started {
+                            info!("miner: peer connected! syncing blocks from network...");
+                            sync_started = true;
+                            last_height = height;
+                        } else {
+                            // Check if sync is progressing or complete
+                            if height > last_height {
+                                info!("miner: sync progress - now at height {}", height);
+                                last_height = height;
+                                stable_count = 0; // Reset stability counter
+                            } else if height == last_height {
+                                stable_count += 1;
+                                // If height hasn't changed for 10 seconds (5 checks * 2 seconds), sync is complete
+                                if stable_count >= 5 {
+                                    info!("miner: sync complete at height {}, starting mining!", height);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Show progress every minute
+                if i % 60 == 0 && !sync_started {
+                    info!("miner: still waiting for peer connection... ({} minutes elapsed)", i / 60);
+                }
+            }
+        }
+
+        if !sync_started {
+            info!("miner: no peers connected after 10 minutes, will create genesis block");
+        }
+
+        // Check if we have a tip from the network (not genesis)
+        if let Ok(Some((_, height, _))) = db.best_tip() {
+            if height > 0 {
+                info!("miner: synced to height {}, starting mining", height);
+            } else {
+                info!("miner: no network blocks found, will create genesis");
+            }
+        } else {
+            info!("miner: no blocks found, will create genesis");
+        }
+
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 info!("miner: shutdown requested");

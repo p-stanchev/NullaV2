@@ -495,8 +495,8 @@ pub mod difficulty {
     pub const ADJUSTMENT_INTERVAL: u64 = 60;
 
     /// Target time per block in seconds.
-    /// Reduced from 60s to 10s for 6x higher throughput.
-    pub const TARGET_BLOCK_TIME: u64 = 10;
+    /// Set to 120s (2 minutes) for reasonable block time while maintaining decentralization.
+    pub const TARGET_BLOCK_TIME: u64 = 120;
 
     /// Maximum difficulty adjustment factor (4x).
     /// Prevents difficulty from changing too rapidly.
