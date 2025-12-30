@@ -815,12 +815,11 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Determine if gossip should be enabled (default true unless --no-gossip is set).
-    let gossip_enabled =
-        !args.no_gossip && (args.gossip || args.listen.is_empty() || !args.listen.is_empty());
+    // Gossip is enabled by default unless --no-gossip is explicitly set
+    let gossip_enabled = !args.no_gossip;
 
-    // Determine if Dandelion++ should be enabled (default true unless --no-dandelion is set).
-    let dandelion_enabled = !args.no_dandelion && (args.dandelion || true);
+    // Dandelion++ is enabled by default unless --no-dandelion is explicitly set
+    let dandelion_enabled = !args.no_dandelion;
 
     // Store network command channel outside the if block for RPC access
     let cmd_tx = if gossip_enabled {
