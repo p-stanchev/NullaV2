@@ -1328,17 +1328,21 @@ async fn handle_network_events(
                     match resp {
                         protocol::Resp::Tip {
                             height,
-                            id,
+                            id: _,
                             cumulative_work: _,
                         } => {
-                            let local_height =
-                                db.best_tip().ok().flatten().map(|(_, h, _)| h).unwrap_or(0);
+                            let local_tip =
+                                db.best_tip().ok().flatten();
+                            let local_height = local_tip.as_ref().map(|(_, h, _)| *h).unwrap_or(0);
                             if height > local_height {
+                                // Request headers starting from OUR tip, not the peer's tip
+                                // GetHeaders walks backwards, so we need to start from our local chain
+                                let from_id = local_tip.map(|(id, _, _)| id).unwrap_or([0u8; 32]);
                                 let _ = cmd_tx
                                     .send(NetworkCommand::SendRequest {
                                         peer,
                                         req: protocol::Req::GetHeaders {
-                                            from: id,
+                                            from: from_id,
                                             limit: protocol::MAX_HEADERS as u32,
                                         },
                                     })
@@ -1552,6 +1556,21 @@ async fn process_full_block(
             hex::encode(block_id),
             block.txs.len()
         );
+    }
+
+    // Check if we already have this block
+    if db.get_block(&block_id).ok().flatten().is_some() {
+        debug!("already have block {} at height {}, skipping", hex::encode(block_id), block.header.height);
+        return false; // Don't re-broadcast blocks we already have
+    }
+
+    // Check if we have the parent block (unless this is genesis)
+    if block.header.prev != [0u8; 32] {
+        if db.get_block(&block.header.prev).ok().flatten().is_none() {
+            debug!("missing parent block {} for block {} at height {}, skipping until parent arrives",
+                hex::encode(block.header.prev), hex::encode(block_id), block.header.height);
+            return false; // Don't process or re-broadcast blocks with missing parents
+        }
     }
 
     if let Err(e) = nulla_core::validate_block(&block) {
