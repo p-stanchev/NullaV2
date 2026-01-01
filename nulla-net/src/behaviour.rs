@@ -27,9 +27,14 @@ pub fn build_behaviour(
 
     // Configure gossipsub for reliable message propagation.
     // SECURITY FIX (HIGH-003): Increased from 64KB to 5MB to support MAX_BLOCK_SIZE (4MB)
+    // Mesh parameters adjusted to work with small networks (even just 2 peers)
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .validation_mode(gossipsub::ValidationMode::Strict)
         .max_transmit_size(1024 * 1024 * 5) // 5MB to accommodate 4MB blocks + overhead
+        .mesh_n_low(1)     // Min peers in mesh: 1 (default 5)
+        .mesh_n(2)         // Target peers in mesh: 2 (default 6)
+        .mesh_n_high(3)    // Max peers before pruning: 3 (default 12)
+        .mesh_outbound_min(1) // Min outbound connections: 1 (default 2)
         .build()
         .expect("gossipsub config");
 

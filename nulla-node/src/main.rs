@@ -2416,9 +2416,11 @@ fn spawn_miner_real(
             }
 
             // Broadcast the full block to the network (includes transactions).
+            info!("miner: sending PublishFullBlock command for height {}", next_height);
             let _ = cmd_tx
                 .send(NetworkCommand::PublishFullBlock { block })
                 .await;
+            info!("miner: PublishFullBlock command sent");
         }
     });
     Ok(())
