@@ -682,6 +682,7 @@ async fn apply_command(
     chain_id: [u8; 4],
     evt_tx: &async_channel::Sender<NetworkEvent>,
 ) {
+    tracing::debug!("apply_command called with command: {:?}", std::mem::discriminant(&command));
     match command {
         NetworkCommand::Dial(addr) => {
             if let Err(err) = Swarm::dial(swarm, addr.clone()) {
