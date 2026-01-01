@@ -17,7 +17,7 @@ use nulla_net::{self, protocol, NetConfig, NetworkCommand, NetworkEvent};
 use nulla_wallet::Wallet;
 use tokio::signal;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 /// Maximum depth for chain reorganizations (SECURITY FIX: HIGH-NEW-002).
@@ -1228,9 +1228,10 @@ async fn handle_network_events(
                 }
 
                 // Re-broadcast header to gossip network (relay to other peers)
-                let _ = cmd_tx
-                    .send(nulla_net::NetworkCommand::PublishBlock { header: header_clone })
-                    .await;
+                match cmd_tx.send(nulla_net::NetworkCommand::PublishBlock { header: header_clone }).await {
+                    Ok(_) => debug!("re-broadcast header command sent"),
+                    Err(e) => warn!("FAILED to send header re-broadcast command: {:?}", e),
+                }
             }
             NetworkEvent::FullBlock { from, block } => {
                 let block_id = nulla_core::block_id(&block);
@@ -1255,9 +1256,11 @@ async fn handle_network_events(
 
                 // Re-broadcast valid blocks to gossip network (relay to other peers)
                 if is_valid {
-                    let _ = cmd_tx
-                        .send(nulla_net::NetworkCommand::PublishFullBlock { block: block_clone })
-                        .await;
+                    let height = block_clone.header.height;
+                    match cmd_tx.send(nulla_net::NetworkCommand::PublishFullBlock { block: block_clone }).await {
+                        Ok(_) => debug!("re-broadcast command sent for block at height {}", height),
+                        Err(e) => warn!("FAILED to send re-broadcast command: {:?}", e),
+                    }
 
                     // Process orphan children if any
                     if let Some(children_ids) = orphan_children.remove(&block_id) {
@@ -1268,9 +1271,11 @@ async fn handle_network_events(
                                 let child_clone = child_block.clone();
                                 let child_valid = process_full_block(&db, &sync_progress, child_block, child_from, &chain_id).await;
                                 if child_valid {
-                                    let _ = cmd_tx
-                                        .send(nulla_net::NetworkCommand::PublishFullBlock { block: child_clone })
-                                        .await;
+                                    let child_height = child_clone.header.height;
+                                    match cmd_tx.send(nulla_net::NetworkCommand::PublishFullBlock { block: child_clone }).await {
+                                        Ok(_) => debug!("re-broadcast command sent for orphan child at height {}", child_height),
+                                        Err(e) => warn!("FAILED to send re-broadcast command for orphan: {:?}", e),
+                                    }
 
                                     // Recursively process grandchildren
                                     if let Some(grandchildren) = orphan_children.remove(&child_id) {
@@ -2416,11 +2421,12 @@ fn spawn_miner_real(
             }
 
             // Broadcast the full block to the network (includes transactions).
-            info!("miner: sending PublishFullBlock command for height {}", next_height);
-            let _ = cmd_tx
-                .send(NetworkCommand::PublishFullBlock { block })
-                .await;
-            info!("miner: PublishFullBlock command sent");
+            info!("miner: sending PublishFullBlock command for height {} (channel capacity: {}, len: {})",
+                next_height, cmd_tx.capacity().unwrap_or(0), cmd_tx.len());
+            match cmd_tx.send(NetworkCommand::PublishFullBlock { block }).await {
+                Ok(_) => info!("miner: PublishFullBlock command sent successfully (channel len after send: {})", cmd_tx.len()),
+                Err(e) => error!("miner: FAILED to send PublishFullBlock command: {:?}", e),
+            }
         }
     });
     Ok(())

@@ -442,6 +442,7 @@ pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError>
     info!("spawning network task with 30s heartbeat enabled");
     tokio::spawn(async move {
         run_swarm(swarm, cmd_rx, evt_tx, chain_id, cover_traffic).await;
+        tracing::error!("network task exited unexpectedly");
     });
 
     Ok(NetworkHandle {
@@ -490,33 +491,42 @@ async fn run_swarm(
     pin!(cover_traffic_sleep);
 
     loop {
-        // Use biased select to prioritize timers over swarm events
-        select! {
-            biased;
+        tracing::trace!("loop iteration, cmd_rx len: {}", cmd_rx.len());
 
+        // CRITICAL FIX: Process all pending commands before handling swarm events
+        // This prevents swarm event stream from starving command processing
+        while let Ok(command) = cmd_rx.try_recv() {
+            tracing::debug!("processing pending command from cmd_rx");
+            apply_command(&mut swarm, command, chain_id, &evt_tx).await;
+        }
+
+        select! {
             _ = heartbeat_interval.tick() => {
-                // Log heartbeat with connected peer count.
                 let connected_peers = swarm.connected_peers().count();
                 info!("total peers connected: {}", connected_peers);
                 tracing::debug!("heartbeat fired, next in 30s");
             }
             _ = &mut cover_traffic_sleep, if cover_traffic => {
-                // Broadcast a cover traffic noise message with randomized timing.
                 let delay_secs = next_cover_traffic_delay().as_secs();
                 tracing::debug!("sending cover traffic, next in ~{} seconds", delay_secs);
                 gossip::send_cover_traffic(&mut swarm, chain_id);
-                // Reset timer with new random delay
                 cover_traffic_sleep.set(tokio::time::sleep(next_cover_traffic_delay()));
+            }
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Ok(command) => {
+                        tracing::debug!("received command from cmd_rx");
+                        apply_command(&mut swarm, command, chain_id, &evt_tx).await
+                    },
+                    Err(e) => {
+                        tracing::warn!("cmd_rx closed: {:?}, exiting loop", e);
+                        break
+                    },
+                }
             }
             swarm_event = swarm.select_next_some() => {
                 if handle_swarm_event(&mut swarm, swarm_event, &evt_tx).await.is_err() {
                     // Best-effort logging, do not crash the loop.
-                }
-            }
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Ok(command) => apply_command(&mut swarm, command, chain_id, &evt_tx).await,
-                    Err(_) => break,
                 }
             }
         }
@@ -670,7 +680,9 @@ async fn handle_swarm_event(
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             let _ = evt_tx.send(NetworkEvent::PeerDisconnected(peer_id)).await;
         }
-        _ => {}
+        other => {
+            tracing::trace!("unhandled swarm event: {:?}", other);
+        }
     }
     Ok(())
 }
@@ -682,7 +694,6 @@ async fn apply_command(
     chain_id: [u8; 4],
     evt_tx: &async_channel::Sender<NetworkEvent>,
 ) {
-    tracing::info!("NET: apply_command called");
     match command {
         NetworkCommand::Dial(addr) => {
             if let Err(err) = Swarm::dial(swarm, addr.clone()) {
@@ -699,7 +710,7 @@ async fn apply_command(
             gossip::publish_block(swarm, header);
         }
         NetworkCommand::PublishFullBlock { block } => {
-            tracing::info!("NET: received PublishFullBlock command for height {}", block.header.height);
+            tracing::debug!("publishing full block at height {}", block.header.height);
             if !gossip::publish_full_block(swarm, block) {
                 let _ = evt_tx
                     .send(NetworkEvent::BroadcastFailed {
