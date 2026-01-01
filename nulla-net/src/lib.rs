@@ -437,7 +437,7 @@ pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError>
         let _ = swarm.behaviour_mut().kad.bootstrap();
     }
 
-    let (cmd_tx, cmd_rx) = async_channel::bounded(64);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(2048);  // Increased from 64 to handle bursts of block broadcasts
     let (evt_tx, evt_rx) = async_channel::bounded(1024);
     info!("spawning network task with 30s heartbeat enabled");
     tokio::spawn(async move {
