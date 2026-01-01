@@ -682,7 +682,7 @@ async fn apply_command(
     chain_id: [u8; 4],
     evt_tx: &async_channel::Sender<NetworkEvent>,
 ) {
-    tracing::debug!("apply_command called with command: {:?}", std::mem::discriminant(&command));
+    tracing::info!("NET: apply_command called");
     match command {
         NetworkCommand::Dial(addr) => {
             if let Err(err) = Swarm::dial(swarm, addr.clone()) {
@@ -699,7 +699,7 @@ async fn apply_command(
             gossip::publish_block(swarm, header);
         }
         NetworkCommand::PublishFullBlock { block } => {
-            tracing::debug!("received PublishFullBlock command for height {}", block.header.height);
+            tracing::info!("NET: received PublishFullBlock command for height {}", block.header.height);
             if !gossip::publish_full_block(swarm, block) {
                 let _ = evt_tx
                     .send(NetworkEvent::BroadcastFailed {
