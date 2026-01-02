@@ -438,7 +438,7 @@ pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError>
     }
 
     let (cmd_tx, cmd_rx) = async_channel::bounded(2048);  // Increased from 64 to handle bursts of block broadcasts
-    let (evt_tx, evt_rx) = async_channel::bounded(1024);
+    let (evt_tx, evt_rx) = async_channel::bounded(8192);
     info!("spawning network task with 30s heartbeat enabled");
     tokio::spawn(async move {
         run_swarm(swarm, cmd_rx, evt_tx, chain_id, cover_traffic).await;
@@ -582,7 +582,7 @@ async fn handle_swarm_event(
 ) -> Result<(), NetError> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
-            let _ = evt_tx.send(NetworkEvent::NewListen(address)).await;
+            send_event_with_timeout(evt_tx, NetworkEvent::NewListen(address)).await;
         }
         SwarmEvent::Behaviour(behaviour_event) => match behaviour_event {
             behaviour::BehaviourEvent::Ping(ping::Event {
@@ -592,7 +592,7 @@ async fn handle_swarm_event(
             }) => {
                 if result.is_ok() {
                     info!("ping ok from {peer} on connection {connection:?}");
-                    let _ = evt_tx.send(NetworkEvent::PeerConnected(peer)).await;
+                    send_event_with_timeout(evt_tx, NetworkEvent::PeerConnected(peer)).await;
                 }
             }
             behaviour::BehaviourEvent::Gossipsub(ev) => {
@@ -673,7 +673,7 @@ async fn handle_swarm_event(
             }
         },
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
-            let _ = evt_tx.send(NetworkEvent::PeerDisconnected(peer_id)).await;
+            send_event_with_timeout(evt_tx, NetworkEvent::PeerDisconnected(peer_id)).await;
         }
         other => {
             tracing::trace!("unhandled swarm event: {:?}", other);
@@ -707,11 +707,13 @@ async fn apply_command(
         NetworkCommand::PublishFullBlock { block } => {
             tracing::info!("network thread: received PublishFullBlock command for height {}", block.header.height);
             if !gossip::publish_full_block(swarm, block) {
-                let _ = evt_tx
-                    .send(NetworkEvent::BroadcastFailed {
+                send_event_with_timeout(
+                    evt_tx,
+                    NetworkEvent::BroadcastFailed {
                         reason: "No peers connected to broadcast block".to_string(),
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
         }
         NetworkCommand::SendRequest { peer, req } => {
@@ -725,6 +727,22 @@ async fn apply_command(
                 .behaviour_mut()
                 .request_response
                 .send_response(channel, resp);
+        }
+    }
+}
+
+async fn send_event_with_timeout(
+    evt_tx: &async_channel::Sender<NetworkEvent>,
+    event: NetworkEvent,
+) {
+    let timeout = Duration::from_millis(200);
+    match tokio::time::timeout(timeout, evt_tx.send(event)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!("failed to send network event: {err:?}");
+        }
+        Err(_) => {
+            tracing::warn!("dropping network event after 200ms send timeout");
         }
     }
 }

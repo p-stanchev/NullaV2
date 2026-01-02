@@ -86,40 +86,64 @@ pub async fn handle_gossip_message(
     if let Ok(msg) = postcard::from_bytes::<protocol::GossipMsg>(data) {
         match msg {
             protocol::GossipMsg::InvTx { txid } => {
-                let _ = evt_tx
-                    .send(crate::NetworkEvent::TxInv {
+                send_event_with_timeout(
+                    evt_tx,
+                    crate::NetworkEvent::TxInv {
                         from: propagation_source,
                         txid,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
             protocol::GossipMsg::FullTx { tx } => {
-                let _ = evt_tx
-                    .send(crate::NetworkEvent::FullTx {
+                send_event_with_timeout(
+                    evt_tx,
+                    crate::NetworkEvent::FullTx {
                         from: propagation_source,
                         tx,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
             protocol::GossipMsg::InvBlock { header } => {
-                let _ = evt_tx
-                    .send(crate::NetworkEvent::BlockInv {
+                send_event_with_timeout(
+                    evt_tx,
+                    crate::NetworkEvent::BlockInv {
                         from: propagation_source,
                         header,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
             protocol::GossipMsg::FullBlock { block } => {
-                let _ = evt_tx
-                    .send(crate::NetworkEvent::FullBlock {
+                send_event_with_timeout(
+                    evt_tx,
+                    crate::NetworkEvent::FullBlock {
                         from: propagation_source,
                         block,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
             protocol::GossipMsg::Noise { .. } => {
                 // Ignore cover traffic noise messages.
             }
+        }
+    }
+}
+
+async fn send_event_with_timeout(
+    evt_tx: &async_channel::Sender<crate::NetworkEvent>,
+    event: crate::NetworkEvent,
+) {
+    let timeout = std::time::Duration::from_millis(200);
+    match tokio::time::timeout(timeout, evt_tx.send(event)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!("failed to send gossip event: {err:?}");
+        }
+        Err(_) => {
+            tracing::warn!("dropping gossip event after 200ms send timeout");
         }
     }
 }
