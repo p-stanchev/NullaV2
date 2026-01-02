@@ -49,16 +49,22 @@ pub fn build_behaviour(
     // Subscribe to transaction and block topics.
     let tx_topic = gossipsub::IdentTopic::new(protocol::topic_inv_tx(chain_id));
     let block_topic = gossipsub::IdentTopic::new(protocol::topic_inv_block(chain_id));
+
+    tracing::info!("subscribing to gossipsub topic: {}", tx_topic);
     gossipsub
         .subscribe(&tx_topic)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(io::Error::new(io::ErrorKind::Other, e))
         })?;
+    tracing::info!("successfully subscribed to topic: {}", tx_topic);
+
+    tracing::info!("subscribing to gossipsub topic: {}", block_topic);
     gossipsub
         .subscribe(&block_topic)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(io::Error::new(io::ErrorKind::Other, e))
         })?;
+    tracing::info!("successfully subscribed to topic: {}", block_topic);
 
     // Configure Kademlia DHT for peer discovery.
     let store = kad::store::MemoryStore::new(peer_id);

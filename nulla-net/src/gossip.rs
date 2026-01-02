@@ -41,6 +41,8 @@ pub fn publish_block(swarm: &mut Swarm<Behaviour>, header: BlockHeader) {
 pub fn publish_full_block(swarm: &mut Swarm<Behaviour>, block: Block) -> bool {
     tracing::info!("publish_full_block called for height {}", block.header.height);
     let peer_count = swarm.connected_peers().count();
+    tracing::info!("connected peers: {}", peer_count);
+
     if peer_count == 0 {
         tracing::warn!("cannot publish block: no peers connected");
         return false;
@@ -53,11 +55,22 @@ pub fn publish_full_block(swarm: &mut Swarm<Behaviour>, block: Block) -> bool {
     if let Ok(data) = postcard::to_allocvec(&msg) {
         tracing::info!("serialized block height {} successfully, size={} bytes", block.header.height, data.len());
         let topic = gossipsub::IdentTopic::new(protocol::topic_inv_block(&block.header.chain_id));
+        tracing::info!("publishing to topic: {}", topic);
+
+        // Get mesh peers for this topic to diagnose mesh formation (collect count before mutable borrow)
+        let mesh_peer_count = swarm.behaviour().gossipsub.mesh_peers(&topic.hash()).count();
+        tracing::info!("mesh peers for topic {}: {} peers in mesh", topic, mesh_peer_count);
+
         let result = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data);
         match &result {
-            Ok(_) => tracing::info!("published block height={} to gossipsub topic {} ({} peers)",
-                block.header.height, topic, peer_count),
-            Err(e) => tracing::warn!("failed to publish block to gossipsub: {:?}", e),
+            Ok(msg_id) => tracing::info!(
+                "✓ published block height={} to gossipsub topic {} ({} connected peers, {} mesh peers, msg_id={:?})",
+                block.header.height, topic, peer_count, mesh_peer_count, msg_id
+            ),
+            Err(e) => tracing::error!(
+                "✗ FAILED to publish block height={} to gossipsub topic {}: {:?} ({} connected peers, {} mesh peers)",
+                block.header.height, topic, e, peer_count, mesh_peer_count
+            ),
         }
         result.is_ok()
     } else {

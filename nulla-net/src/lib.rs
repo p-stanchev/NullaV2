@@ -633,13 +633,29 @@ async fn handle_swarm_event(
                 }
             }
             behaviour::BehaviourEvent::Gossipsub(ev) => {
-                if let libp2p::gossipsub::Event::Message {
-                    propagation_source,
-                    message,
-                    ..
-                } = ev
-                {
-                    gossip::handle_gossip_message(propagation_source, &message.data, evt_tx).await;
+                match ev {
+                    libp2p::gossipsub::Event::Message {
+                        propagation_source,
+                        message,
+                        ..
+                    } => {
+                        tracing::info!(
+                            "gossipsub: received message from {} on topic {} (size: {} bytes)",
+                            propagation_source,
+                            message.topic,
+                            message.data.len()
+                        );
+                        gossip::handle_gossip_message(propagation_source, &message.data, evt_tx).await;
+                    }
+                    libp2p::gossipsub::Event::Subscribed { peer_id, topic } => {
+                        tracing::info!("gossipsub: peer {} subscribed to topic {}", peer_id, topic);
+                    }
+                    libp2p::gossipsub::Event::Unsubscribed { peer_id, topic } => {
+                        tracing::warn!("gossipsub: peer {} unsubscribed from topic {}", peer_id, topic);
+                    }
+                    libp2p::gossipsub::Event::GossipsubNotSupported { peer_id } => {
+                        tracing::warn!("gossipsub: peer {} does not support gossipsub", peer_id);
+                    }
                 }
             }
             behaviour::BehaviourEvent::Kad(kad_event) => {
