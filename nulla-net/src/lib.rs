@@ -523,7 +523,32 @@ async fn run_swarm(
                             NetworkCommand::SendResponse { .. } => "SendResponse",
                         };
                         tracing::info!("network event loop: received {} command (queue len: {})", cmd_type, cmd_rx.len());
-                        apply_command(&mut swarm, command, chain_id, &evt_tx).await
+                        apply_command(&mut swarm, command, chain_id, &evt_tx).await;
+
+                        // Drain additional commands if queue is backing up (process up to 10 per iteration)
+                        let mut drained = 0;
+                        while drained < 10 {
+                            match cmd_rx.try_recv() {
+                                Ok(cmd) => {
+                                    drained += 1;
+                                    let cmd_type = match &cmd {
+                                        NetworkCommand::Dial(_) => "Dial",
+                                        NetworkCommand::PublishTx { .. } => "PublishTx",
+                                        NetworkCommand::PublishFullTx { .. } => "PublishFullTx",
+                                        NetworkCommand::PublishBlock { .. } => "PublishBlock",
+                                        NetworkCommand::PublishFullBlock { .. } => "PublishFullBlock",
+                                        NetworkCommand::SendRequest { .. } => "SendRequest",
+                                        NetworkCommand::SendResponse { .. } => "SendResponse",
+                                    };
+                                    tracing::info!("network event loop: draining {} command (queue len: {}, drained: {})", cmd_type, cmd_rx.len(), drained);
+                                    apply_command(&mut swarm, cmd, chain_id, &evt_tx).await;
+                                },
+                                Err(_) => break, // Queue empty
+                            }
+                        }
+                        if drained > 0 {
+                            tracing::info!("drained {} commands from queue", drained);
+                        }
                     },
                     Err(e) => {
                         tracing::warn!("cmd_rx closed: {:?}, exiting loop", e);
