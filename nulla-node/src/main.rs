@@ -905,7 +905,7 @@ async fn main() -> Result<()> {
         let cmd_tx = handle.commands.clone();
         let sync_progress = Arc::new(Mutex::new(None::<ProgressBar>));
         let sync_target_height = Arc::new(AtomicU64::new(0));
-        tokio::spawn(handle_network_events(
+        tokio::spawn(network_events_supervisor(
             handle.events,
             cmd_tx.clone(),
             db.clone(),
@@ -1046,6 +1046,54 @@ fn merge_peers_with_bootstrap(user_peers: Vec<libp2p::Multiaddr>) -> Vec<libp2p:
     }
 
     final_peers
+}
+
+/// Restart the network event handler if it panics or exits unexpectedly.
+async fn network_events_supervisor(
+    rx: async_channel::Receiver<NetworkEvent>,
+    cmd_tx: async_channel::Sender<NetworkCommand>,
+    db: NullaDb,
+    sync_progress: Arc<Mutex<Option<ProgressBar>>>,
+    seed_mode: bool,
+    chain_id: [u8; 4],
+    sync_target_height: Arc<AtomicU64>,
+) {
+    use libp2p::futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let mut restart_delay = std::time::Duration::from_secs(1);
+    loop {
+        let result = AssertUnwindSafe(handle_network_events(
+            rx.clone(),
+            cmd_tx.clone(),
+            db.clone(),
+            sync_progress.clone(),
+            seed_mode,
+            chain_id,
+            sync_target_height.clone(),
+        ))
+        .catch_unwind()
+        .await;
+
+        if rx.is_closed() {
+            warn!("network event channel closed; stopping event supervisor");
+            break;
+        }
+
+        match result {
+            Ok(_) => warn!(
+                "network event handler exited; restarting in {}s",
+                restart_delay.as_secs()
+            ),
+            Err(_) => warn!(
+                "network event handler panicked; restarting in {}s",
+                restart_delay.as_secs()
+            ),
+        }
+
+        tokio::time::sleep(restart_delay).await;
+        restart_delay = (restart_delay * 2).min(std::time::Duration::from_secs(30));
+    }
 }
 
 /// Handle network events and respond to requests.
