@@ -560,6 +560,27 @@ async fn run_swarm(
                 }
             }
         }
+
+        // Post-drain in case commands arrived while select! was waiting on events.
+        while let Ok(command) = cmd_rx.try_recv() {
+            let cmd_type = match &command {
+                NetworkCommand::Dial(_) => "Dial",
+                NetworkCommand::PublishTx { .. } => "PublishTx",
+                NetworkCommand::PublishFullTx { .. } => "PublishFullTx",
+                NetworkCommand::PublishBlock { .. } => "PublishBlock",
+                NetworkCommand::PublishFullBlock { block } => {
+                    tracing::warn!(
+                        "!!! POST-DRAIN: PublishFullBlock for height {} !!!",
+                        block.header.height
+                    );
+                    "PublishFullBlock"
+                },
+                NetworkCommand::SendRequest { .. } => "SendRequest",
+                NetworkCommand::SendResponse { .. } => "SendResponse",
+            };
+            tracing::info!("post-draining {} command (queue len: {})", cmd_type, cmd_rx.len());
+            apply_command(&mut swarm, command, chain_id, &evt_tx).await;
+        }
     }
 }
 
