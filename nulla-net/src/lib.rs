@@ -512,7 +512,16 @@ async fn run_swarm(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Ok(command) => {
-                        tracing::info!("network event loop: received command from cmd_rx (queue len: {})", cmd_rx.len());
+                        let cmd_type = match &command {
+                            NetworkCommand::Dial(_) => "Dial",
+                            NetworkCommand::PublishTx { .. } => "PublishTx",
+                            NetworkCommand::PublishFullTx { .. } => "PublishFullTx",
+                            NetworkCommand::PublishBlock { .. } => "PublishBlock",
+                            NetworkCommand::PublishFullBlock { .. } => "PublishFullBlock",
+                            NetworkCommand::SendRequest { .. } => "SendRequest",
+                            NetworkCommand::SendResponse { .. } => "SendResponse",
+                        };
+                        tracing::info!("network event loop: received {} command (queue len: {})", cmd_type, cmd_rx.len());
                         apply_command(&mut swarm, command, chain_id, &evt_tx).await
                     },
                     Err(e) => {
