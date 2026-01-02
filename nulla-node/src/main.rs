@@ -1212,6 +1212,25 @@ async fn handle_network_events(
                     continue;
                 }
 
+                // If we don't have the full block yet, request it from the sender.
+                if db.get_block(&block_id).ok().flatten().is_none() {
+                    if inflight_block_requests < MAX_INFLIGHT_BLOCK_REQ {
+                        info!(
+                            "requesting full block {} at height {} from {}",
+                            hex::encode(block_id),
+                            header.height,
+                            from
+                        );
+                        let _ = cmd_tx
+                            .send(NetworkCommand::SendRequest {
+                                peer: from,
+                                req: protocol::Req::GetBlock { id: block_id },
+                            })
+                            .await;
+                        inflight_block_requests += 1;
+                    }
+                }
+
                 // Calculate cumulative work for this block.
                 let block_work = nulla_core::target_work(&header.target);
                 let cumulative_work = if header.prev == [0u8; 32] {
