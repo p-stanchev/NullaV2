@@ -2307,17 +2307,20 @@ async fn broadcast_mined_block(
     let block_id = nulla_core::block_id(&block);
 
     info!(
-        "broadcasting newly mined block height={} id={} (channel capacity: {}, len: {})",
+        "broadcasting newly mined block height={} id={} (channel capacity: {}, len: {}, is_closed: {})",
         height,
         hex::encode(block_id),
         cmd_tx.capacity().unwrap_or(0),
-        cmd_tx.len()
+        cmd_tx.len(),
+        cmd_tx.is_closed()
     );
 
     let header = block.header.clone();
 
     // Send PublishFullBlock command
+    info!("attempting to send PublishFullBlock to channel...");
     let full_block_result = cmd_tx.send(NetworkCommand::PublishFullBlock { block }).await;
+    info!("send attempt completed");
 
     match &full_block_result {
         Ok(_) => {
