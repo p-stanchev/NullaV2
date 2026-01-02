@@ -39,6 +39,7 @@ pub fn publish_block(swarm: &mut Swarm<Behaviour>, header: BlockHeader) {
 /// Publish a full block to the network (includes all transactions).
 /// Returns true if the block was published successfully, false otherwise.
 pub fn publish_full_block(swarm: &mut Swarm<Behaviour>, block: Block) -> bool {
+    tracing::info!("publish_full_block called for height {}", block.header.height);
     let peer_count = swarm.connected_peers().count();
     if peer_count == 0 {
         tracing::warn!("cannot publish block: no peers connected");
@@ -48,7 +49,9 @@ pub fn publish_full_block(swarm: &mut Swarm<Behaviour>, block: Block) -> bool {
     let msg = protocol::GossipMsg::FullBlock {
         block: block.clone(),
     };
+    tracing::info!("attempting to serialize block height {} for gossipsub", block.header.height);
     if let Ok(data) = postcard::to_allocvec(&msg) {
+        tracing::info!("serialized block height {} successfully, size={} bytes", block.header.height, data.len());
         let topic = gossipsub::IdentTopic::new(protocol::topic_inv_block(&block.header.chain_id));
         let result = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data);
         match &result {

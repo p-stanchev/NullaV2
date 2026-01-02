@@ -705,7 +705,7 @@ async fn apply_command(
             gossip::publish_block(swarm, header);
         }
         NetworkCommand::PublishFullBlock { block } => {
-            tracing::debug!("publishing full block at height {}", block.header.height);
+            tracing::info!("network thread: received PublishFullBlock command for height {}", block.header.height);
             if !gossip::publish_full_block(swarm, block) {
                 let _ = evt_tx
                     .send(NetworkEvent::BroadcastFailed {
