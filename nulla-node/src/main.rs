@@ -21,9 +21,9 @@ use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 /// Maximum depth for chain reorganizations (SECURITY FIX: HIGH-NEW-002).
-/// Reorgs deeper than 100 blocks are rejected to prevent DoS attacks.
-/// Bitcoin uses ~6 blocks for finality; 100 blocks provides ample safety margin.
-const MAX_REORG_DEPTH: usize = 100;
+/// Reorgs deeper than 30 blocks are rejected to prevent DoS attacks.
+/// Bitcoin uses ~6 blocks for finality; 30 blocks (60 minutes) provides practical finality.
+const MAX_REORG_DEPTH: usize = 30;
 
 /// Hardcoded bootstrap seed nodes.
 /// These nodes are always added to the peer list to help new nodes join the network.
@@ -31,6 +31,31 @@ const MAX_REORG_DEPTH: usize = 100;
 const BOOTSTRAP_SEEDS: &[&str] = &[
     "/ip4/45.155.53.102/tcp/27444", // Primary seed node (EU)
 ];
+
+/// Show error message when user tries to use deprecated --wallet-seed parameter.
+fn reject_wallet_seed_parameter() -> ! {
+    eprintln!("ERROR: --wallet-seed has been REMOVED for security reasons.");
+    eprintln!("");
+    eprintln!("Command-line arguments expose seeds in:");
+    eprintln!("  • Process listings (ps, top, htop)");
+    eprintln!("  • Shell history files");
+    eprintln!("  • System logs and monitoring");
+    eprintln!("");
+    eprintln!("Use one of these SECURE alternatives:");
+    eprintln!("");
+    eprintln!("1. Environment variable (for automation):");
+    eprintln!("   NULLA_WALLET_SEED=<seed_hex> nulla-node ...");
+    eprintln!("");
+    eprintln!("2. Interactive prompt (for manual use):");
+    eprintln!("   nulla-node --wallet-seed-stdin ...");
+    eprintln!("");
+    eprintln!("3. Encrypted wallet file (RECOMMENDED):");
+    eprintln!("   nulla-node --wallet-file wallet.dat --wallet-password <password>");
+    eprintln!("");
+    eprintln!("4. BIP39 mnemonic phrase:");
+    eprintln!("   nulla-node --from-mnemonic \"word1 word2 ...\"");
+    std::process::exit(1);
+}
 
 /// Command-line arguments for the Nulla node.
 #[derive(Parser, Debug)]
@@ -105,7 +130,7 @@ struct Args {
     rpc: String,
 
     /// Miner payout address for block rewards (40-char hex, 20 bytes).
-    /// Use this instead of --wallet-seed for mining to avoid exposing private keys.
+    /// Using an address allows cold mining without exposing private keys on the mining node.
     /// Example: --miner-address 79bc6374ccc99f1211770ce007e05f6235b98c8b
     #[arg(long)]
     miner_address: Option<String>,
@@ -123,26 +148,34 @@ struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     generate_hd_wallet: bool,
 
+    /// Generate a new HD wallet with BIP39 mnemonic phrase (12 or 24 words).
+    /// This creates a user-friendly backup with memorable words instead of hex.
+    /// Example: --generate-mnemonic 24 (generates 24-word phrase)
+    #[arg(long)]
+    generate_mnemonic: Option<u32>,
+
+    /// Recover wallet from BIP39 mnemonic phrase.
+    /// Provide the phrase as a quoted string.
+    /// Example: --from-mnemonic "abandon abandon abandon..."
+    #[arg(long)]
+    from_mnemonic: Option<String>,
+
+    /// Optional passphrase for BIP39 mnemonic (extra security layer).
+    /// Using a passphrase creates a completely different wallet.
+    /// WARNING: If you lose the passphrase, you cannot recover your wallet!
+    #[arg(long)]
+    mnemonic_passphrase: Option<String>,
+
     /// Derive addresses from HD wallet master seed.
     /// Format: --derive-address <count>
     /// Example: --derive-address 5 (shows first 5 addresses)
-    /// Requires: --wallet-seed (master seed)
+    /// Requires: NULLA_WALLET_SEED environment variable
     #[arg(long)]
     derive_address: Option<u32>,
 
-    /// DEPRECATED: Use environment variable NULLA_WALLET_SEED or --wallet-seed-stdin instead.
-    /// WARNING: Command-line arguments are visible in process listings (ps aux)!
-    /// This option exposes your seed in shell history and process monitors.
-    ///
-    /// Wallet seed (32 bytes hex) to use for signing transactions.
-    /// WARNING: Only use for transaction signing, NOT for mining!
-    /// For mining, use --miner-address instead to avoid exposing your private key.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use NULLA_WALLET_SEED environment variable or --wallet-seed-stdin instead. \
-                CLI arguments expose seeds in process listings and shell history."
-    )]
-    #[arg(long)]
+    /// REMOVED FOR SECURITY: This parameter has been removed as it exposes seeds.
+    /// Use secure alternatives: NULLA_WALLET_SEED env var, --wallet-seed-stdin, or --wallet-file
+    #[arg(long, hide = true)]
     wallet_seed: Option<String>,
 
     /// Read wallet seed from stdin (secure, not visible in ps).
@@ -155,7 +188,7 @@ struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     get_address: bool,
 
-    /// Get wallet balance (requires --wallet-seed and --db).
+    /// Get wallet balance (requires NULLA_WALLET_SEED env var and --db).
     /// DEPRECATED: Use --balance <ADDRESS> instead.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     get_balance: bool,
@@ -166,8 +199,8 @@ struct Args {
     #[arg(long)]
     balance: Option<String>,
 
-    /// Send NULLA to an address (requires --wallet-seed, --to, and --amount).
-    /// Example: --send --to 79bc6374ccc99f1211770ce007e05f6235b98c8b --amount 5.0
+    /// Send NULLA to an address (requires --wallet-file, --to, and --amount).
+    /// Example: --send --to 79bc6374ccc99f1211770ce007e05f6235b98c8b --amount 5.0 --wallet-file wallet.dat
     #[arg(long, action = clap::ArgAction::SetTrue)]
     send: bool,
 
@@ -221,7 +254,7 @@ async fn main() -> Result<()> {
         println!("\nIMPORTANT: Save your seed NOW! This will not be shown again.");
         println!("IMPORTANT: Anyone with this seed can spend your funds.");
         println!("\nTo use this wallet later:");
-        println!("  --wallet-seed {}", seed_hex);
+        println!("  NULLA_WALLET_SEED={} nulla-node --mine", seed_hex);
         println!("\nTo check balance:");
         println!("  --balance {}\n", wallet.address());
         return Ok(());
@@ -244,9 +277,74 @@ async fn main() -> Result<()> {
         println!("\nIMPORTANT: Save your MASTER SEED! This will not be shown again.");
         println!("IMPORTANT: Anyone with this seed can spend funds from ALL derived addresses.");
         println!("\nTo derive more addresses:");
-        println!("  --wallet-seed {} --derive-address 10", seed_hex);
+        println!("  NULLA_WALLET_SEED={} nulla-node --derive-address 10", seed_hex);
         println!("\nTo check balance of any address:");
         println!("  --balance <ADDRESS>\n");
+        return Ok(());
+    }
+
+    // Handle BIP39 mnemonic generation command.
+    if let Some(word_count) = args.generate_mnemonic {
+        use nulla_wallet::Mnemonic;
+
+        let mnemonic = match word_count {
+            12 => Mnemonic::generate_12_words()
+                .map_err(|e| anyhow::anyhow!("Failed to generate mnemonic: {}", e))?,
+            24 => Mnemonic::generate_24_words()
+                .map_err(|e| anyhow::anyhow!("Failed to generate mnemonic: {}", e))?,
+            _ => return Err(anyhow::anyhow!("Invalid word count. Use 12 or 24.")),
+        };
+
+        let passphrase = args.mnemonic_passphrase.as_deref();
+        let wallet = Wallet::from_mnemonic(&mnemonic, passphrase)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        println!("\n=== New HD Wallet Generated with BIP39 Mnemonic ===");
+        println!("\nBACKUP THESE {} WORDS (write them down!):", word_count);
+        println!("\n{}\n", mnemonic.phrase());
+        if passphrase.is_some() {
+            println!("WARNING: Passphrase enabled (you must remember it to recover!)");
+        }
+        println!("\nFirst 5 Addresses:");
+        for i in 0..5 {
+            let addr = wallet.derive_address(i).map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("  [{}] {}", i, addr);
+        }
+        println!("\nCRITICAL: Write down these {} words and keep them safe!", word_count);
+        println!("   These words are your ONLY backup. If you lose them, your funds are GONE FOREVER.");
+        println!("   Anyone with these words can steal your funds.");
+        println!("\nTo recover this wallet later:");
+        println!("  --from-mnemonic \"{}\"", mnemonic.phrase());
+        if passphrase.is_some() {
+            println!("  --mnemonic-passphrase \"<your passphrase>\"");
+        }
+        println!();
+        return Ok(());
+    }
+
+    // Handle BIP39 mnemonic recovery command.
+    if let Some(phrase) = &args.from_mnemonic {
+        use nulla_wallet::Mnemonic;
+
+        let mnemonic = Mnemonic::from_phrase(phrase)
+            .map_err(|e| anyhow::anyhow!("Invalid mnemonic phrase: {}", e))?;
+
+        let passphrase = args.mnemonic_passphrase.as_deref();
+        let wallet = Wallet::from_mnemonic(&mnemonic, passphrase)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        println!("\n=== Wallet Recovered from Mnemonic ===");
+        println!("\nFirst 10 Addresses:");
+        for i in 0..10 {
+            let addr = wallet.derive_address(i).map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("  [{}] {}", i, addr);
+        }
+        println!("\nTo use this wallet for mining:");
+        println!("  --from-mnemonic \"{}\" --mine", phrase);
+        if passphrase.is_some() {
+            println!("  --mnemonic-passphrase \"<your passphrase>\"");
+        }
+        println!();
         return Ok(());
     }
 
@@ -288,8 +386,10 @@ async fn main() -> Result<()> {
 
     // Handle derive address command.
     if let Some(count) = args.derive_address {
-        #[allow(deprecated)]
-        if let Some(seed_hex) = &args.wallet_seed {
+        if args.wallet_seed.is_some() {
+            reject_wallet_seed_parameter();
+        }
+        if let Some(seed_hex) = std::env::var("NULLA_WALLET_SEED").ok() {
             match hex::decode(seed_hex) {
                 Ok(seed_bytes) if seed_bytes.len() == 32 => {
                     let mut master_seed = [0u8; 32];
@@ -311,15 +411,18 @@ async fn main() -> Result<()> {
                 }
             }
         } else {
-            eprintln!("Error: --wallet-seed (master seed) required for --derive-address");
+            eprintln!("Error: NULLA_WALLET_SEED environment variable required for --derive-address");
+            eprintln!("Example: NULLA_WALLET_SEED=<32_byte_hex> nulla-node --derive-address 10");
             std::process::exit(1);
         }
     }
 
     // Handle get address command.
     if args.get_address {
-        #[allow(deprecated)]
-        if let Some(seed_hex) = &args.wallet_seed {
+        if args.wallet_seed.is_some() {
+            reject_wallet_seed_parameter();
+        }
+        if let Some(seed_hex) = std::env::var("NULLA_WALLET_SEED").ok().as_ref() {
             match hex::decode(seed_hex) {
                 Ok(seed_bytes) if seed_bytes.len() == 32 => {
                     let mut seed = [0u8; 32];
@@ -335,15 +438,18 @@ async fn main() -> Result<()> {
                 }
             }
         } else {
-            eprintln!("Error: --wallet-seed required for --get-address");
+            eprintln!("Error: NULLA_WALLET_SEED environment variable required for --get-address");
+            eprintln!("Example: NULLA_WALLET_SEED=<32_byte_hex> nulla-node --get-address");
             std::process::exit(1);
         }
     }
 
     // Handle get balance command.
     if args.get_balance {
-        #[allow(deprecated)]
-        if let Some(seed_hex) = &args.wallet_seed {
+        if args.wallet_seed.is_some() {
+            reject_wallet_seed_parameter();
+        }
+        if let Some(seed_hex) = std::env::var("NULLA_WALLET_SEED").ok().as_ref() {
             match hex::decode(seed_hex) {
                 Ok(seed_bytes) if seed_bytes.len() == 32 => {
                     let mut seed = [0u8; 32];
@@ -388,7 +494,8 @@ async fn main() -> Result<()> {
                 }
             }
         } else {
-            eprintln!("Error: --wallet-seed required for --get-balance");
+            eprintln!("Error: NULLA_WALLET_SEED environment variable required for --get-balance");
+            eprintln!("Example: NULLA_WALLET_SEED=<32_byte_hex> nulla-node --get-balance --db blockchain.db");
             std::process::exit(1);
         }
     }
@@ -446,22 +553,12 @@ async fn main() -> Result<()> {
                 }
             }
         } else {
-            #[allow(deprecated)]
-            if let Some(wallet_seed) = &args.wallet_seed {
-                let seed_bytes = match hex::decode(wallet_seed) {
-                    Ok(bytes) if bytes.len() == 32 => bytes,
-                    _ => {
-                        eprintln!("Error: Invalid wallet seed (must be 32 bytes hex)");
-                        std::process::exit(1);
-                    }
-                };
-                let mut seed = [0u8; 32];
-                seed.copy_from_slice(&seed_bytes);
-                Wallet::from_seed(&seed)
-            } else {
-                eprintln!("Error: --wallet-seed or --wallet-file required for --send");
-                std::process::exit(1);
+            if args.wallet_seed.is_some() {
+                reject_wallet_seed_parameter();
             }
+            eprintln!("Error: --wallet-file required for --send");
+            eprintln!("Example: nulla-node --send --to <address> --amount 10 --wallet-file wallet.dat --wallet-password <pass>");
+            std::process::exit(1);
         };
 
         // Parse recipient address.
@@ -724,50 +821,11 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+    } else if args.wallet_seed.is_some() {
+        // SECURITY FIX (HIGH-AUD-001): --wallet-seed parameter removed
+        reject_wallet_seed_parameter();
     } else {
-        // Option 4: DEPRECATED - Load from CLI argument (INSECURE!)
-        #[allow(deprecated)]
-        if let Some(seed_hex) = &args.wallet_seed {
-            use zeroize::Zeroize;
-
-            eprintln!("⚠️  SECURITY WARNING: --wallet-seed is DEPRECATED and INSECURE!");
-            eprintln!("⚠️  Your seed is visible in:");
-            eprintln!("   - Process listings (ps aux, htop, etc.)");
-            eprintln!("   - Shell history (~/.bash_history, ~/.zsh_history)");
-            eprintln!("   - Process monitoring tools");
-            eprintln!("   - System logs");
-            eprintln!("");
-            eprintln!("Use one of these secure alternatives:");
-            eprintln!("  1. Environment variable:");
-            eprintln!("     NULLA_WALLET_SEED=<seed> nulla-node ...");
-            eprintln!("  2. Standard input (prompts for seed):");
-            eprintln!("     nulla-node --wallet-seed-stdin ...");
-            eprintln!("  3. Encrypted wallet file (recommended):");
-            eprintln!("     nulla-node --wallet-file wallet.dat --wallet-password <password> ...");
-            eprintln!("");
-            eprintln!("Continuing in 5 seconds...");
-            std::thread::sleep(std::time::Duration::from_secs(5));
-
-            match hex::decode(seed_hex) {
-                Ok(seed_bytes) if seed_bytes.len() == 32 => {
-                    let mut seed = [0u8; 32];
-                    seed.copy_from_slice(&seed_bytes);
-                    let wallet = Wallet::from_seed(&seed);
-                    info!("wallet loaded from seed (DEPRECATED), address: {}", wallet.address());
-
-                    // Zeroize seed
-                    seed.zeroize();
-
-                    Some(wallet)
-                }
-                _ => {
-                    warn!("invalid wallet seed (must be 32 bytes hex), ignoring");
-                    None
-                }
-            }
-        } else {
-            None
-        }
+        None
     };
 
     // Parse miner address if provided (for receiving block rewards without exposing private key).
@@ -866,7 +924,7 @@ async fn main() -> Result<()> {
             let coinbase_addr = miner_address.or_else(|| wallet.as_ref().map(|w| w.address()));
 
             if coinbase_addr.is_none() {
-                warn!("mining enabled but no address provided; use --miner-address or --wallet-seed to receive block rewards");
+                warn!("mining enabled but no address provided; use --miner-address or load a wallet to receive block rewards");
             }
             spawn_miner_real(
                 chain_id,
@@ -1252,10 +1310,20 @@ async fn handle_network_events(
                     continue;
                 }
 
+                // SECURITY FIX (HIGH-AUD-005): Clean up mempool spent tracking when block is processed
+                // Store transactions before processing so we can clean up spent tracking
+                let block_txs = block.txs.clone();
+
                 let is_valid = process_full_block(&db, &sync_progress, block, Some(from), &chain_id).await;
 
                 // Re-broadcast valid blocks to gossip network (relay to other peers)
                 if is_valid {
+                    // Remove spent outpoints for transactions that were in this block
+                    for tx in block_txs.iter().skip(1) {
+                        for input in &tx.inputs {
+                            mempool_spent.remove(&input.prevout);
+                        }
+                    }
                     let height = block_clone.header.height;
                     match cmd_tx.send(nulla_net::NetworkCommand::PublishFullBlock { block: block_clone }).await {
                         Ok(_) => debug!("re-broadcast command sent for block at height {}", height),
@@ -1269,8 +1337,15 @@ async fn handle_network_events(
                             if let Some((child_block, child_from)) = orphan_blocks.remove(&child_id) {
                                 debug!("processing orphan child {} at height {}", hex::encode(child_id), child_block.header.height);
                                 let child_clone = child_block.clone();
+                                let child_txs = child_block.txs.clone();
                                 let child_valid = process_full_block(&db, &sync_progress, child_block, child_from, &chain_id).await;
                                 if child_valid {
+                                    // SECURITY FIX (HIGH-AUD-005): Clean up mempool spent tracking
+                                    for tx in child_txs.iter().skip(1) {
+                                        for input in &tx.inputs {
+                                            mempool_spent.remove(&input.prevout);
+                                        }
+                                    }
                                     let child_height = child_clone.header.height;
                                     match cmd_tx.send(nulla_net::NetworkCommand::PublishFullBlock { block: child_clone }).await {
                                         Ok(_) => debug!("re-broadcast command sent for orphan child at height {}", child_height),
@@ -1451,16 +1526,32 @@ async fn handle_network_events(
                                     .or_insert_with(Vec::new)
                                     .push(block_id);
                             } else {
+                                let block_txs = block.txs.clone();
                                 let is_valid = process_full_block(&db, &sync_progress, block, Some(peer), &chain_id).await;
 
                                 // Process orphan children if this block's processing succeeded
                                 if is_valid {
+                                    // SECURITY FIX (HIGH-AUD-005): Clean up mempool spent tracking
+                                    for tx in block_txs.iter().skip(1) {
+                                        for input in &tx.inputs {
+                                            mempool_spent.remove(&input.prevout);
+                                        }
+                                    }
                                     if let Some(children_ids) = orphan_children.remove(&block_id) {
                                         info!("processing {} orphan children of block {}", children_ids.len(), hex::encode(block_id));
                                         for child_id in children_ids {
                                             if let Some((child_block, child_from)) = orphan_blocks.remove(&child_id) {
                                                 debug!("processing orphan child {} at height {}", hex::encode(child_id), child_block.header.height);
-                                                process_full_block(&db, &sync_progress, child_block, child_from, &chain_id).await;
+                                                let child_txs = child_block.txs.clone();
+                                                let child_valid = process_full_block(&db, &sync_progress, child_block, child_from, &chain_id).await;
+                                                // SECURITY FIX (HIGH-AUD-005): Clean up mempool spent tracking
+                                                if child_valid {
+                                                    for tx in child_txs.iter().skip(1) {
+                                                        for input in &tx.inputs {
+                                                            mempool_spent.remove(&input.prevout);
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }

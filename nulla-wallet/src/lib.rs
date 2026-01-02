@@ -3,12 +3,14 @@
 //! This crate provides:
 //! - Key generation (Ed25519 keypairs)
 //! - HD (Hierarchical Deterministic) wallet support
+//! - BIP39 mnemonic phrase support (12 or 24 words)
 //! - Address derivation from public keys (P2PKH and P2SH)
 //! - Multi-signature wallet support
 //! - Transaction signing
 //! - UTXO management for wallet balances
 
 pub mod address;
+pub mod mnemonic;
 pub mod multisig;
 pub mod psbt;
 
@@ -23,6 +25,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // Re-export address types
 pub use address::{Address, AddressVersion};
+// Re-export mnemonic types
+pub use mnemonic::{Mnemonic, MnemonicError, Seed};
 // Re-export multisig types
 pub use multisig::{MultiSigConfig, create_2_of_2, create_2_of_3, create_multisig};
 // Re-export PSBT types
@@ -270,6 +274,35 @@ impl Wallet {
             keypair,
             master_seed: Some(*master_seed),
         })
+    }
+
+    /// Create an HD wallet from a BIP39 mnemonic phrase.
+    ///
+    /// This is the recommended way to create a new wallet, as mnemonics
+    /// provide a user-friendly backup mechanism (12 or 24 words).
+    ///
+    /// # Arguments
+    /// * `mnemonic` - A BIP39 mnemonic phrase (12 or 24 words)
+    /// * `passphrase` - Optional passphrase for additional security
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use nulla_wallet::{Wallet, Mnemonic};
+    ///
+    /// // Generate new wallet with 24-word mnemonic
+    /// let mnemonic = Mnemonic::generate_24_words().unwrap();
+    /// println!("BACKUP THESE WORDS: {}", mnemonic.phrase());
+    /// let wallet = Wallet::from_mnemonic(&mnemonic, None).unwrap();
+    ///
+    /// // Later, recover from backup
+    /// let phrase = "abandon abandon abandon..."; // User's backup words
+    /// let recovered_mnemonic = Mnemonic::from_phrase(phrase).unwrap();
+    /// let recovered_wallet = Wallet::from_mnemonic(&recovered_mnemonic, None).unwrap();
+    /// ```
+    pub fn from_mnemonic(mnemonic: &Mnemonic, passphrase: Option<&str>) -> Result<Self> {
+        let seed = mnemonic.to_seed(passphrase);
+        let master_seed = seed.to_master_seed();
+        Self::from_master_seed(&master_seed)
     }
 
     /// Derive a new address from the master seed at the given index.

@@ -493,13 +493,8 @@ async fn run_swarm(
     loop {
         tracing::trace!("loop iteration, cmd_rx len: {}", cmd_rx.len());
 
-        // CRITICAL FIX: Process all pending commands before handling swarm events
-        // This prevents swarm event stream from starving command processing
-        while let Ok(command) = cmd_rx.try_recv() {
-            tracing::debug!("processing pending command from cmd_rx");
-            apply_command(&mut swarm, command, chain_id, &evt_tx).await;
-        }
-
+        // tokio::select! fairly distributes processing across all branches,
+        // preventing both command starvation and swarm event starvation
         select! {
             _ = heartbeat_interval.tick() => {
                 let connected_peers = swarm.connected_peers().count();

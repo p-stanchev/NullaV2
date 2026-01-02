@@ -364,8 +364,14 @@ impl NullaDb {
         // Extract address from script_pubkey and index this UTXO
         if let Some(addr_bytes) = extract_address_bytes(&txout.script_pubkey) {
             // Get existing outpoints for this address
+            // SECURITY FIX (CRIT-AUD-002): Proper error propagation for database corruption detection
             let mut outpoints: Vec<OutPoint> = match self.utxo_by_addr.get(&addr_bytes)? {
-                Some(bytes) => bincode::deserialize(&bytes).unwrap_or_default(),
+                Some(bytes) => {
+                    bincode::deserialize(&bytes).map_err(|e| {
+                        eprintln!("CRITICAL: Failed to deserialize UTXO index for address, database may be corrupted: {}", e);
+                        e
+                    })?
+                }
                 None => Vec::new(),
             };
 
@@ -406,9 +412,12 @@ impl NullaDb {
         if let Some(txout) = self.get_utxo(out)? {
             if let Some(addr_bytes) = extract_address_bytes(&txout.script_pubkey) {
                 // Remove from address index
+                // SECURITY FIX (CRIT-AUD-002): Proper error propagation for database corruption detection
                 if let Some(bytes) = self.utxo_by_addr.get(&addr_bytes)? {
-                    let mut outpoints: Vec<OutPoint> =
-                        bincode::deserialize(&bytes).unwrap_or_default();
+                    let mut outpoints: Vec<OutPoint> = bincode::deserialize(&bytes).map_err(|e| {
+                        eprintln!("CRITICAL: Failed to deserialize UTXO index for address during removal, database may be corrupted: {}", e);
+                        e
+                    })?;
                     outpoints.retain(|o| o != out);
                     if outpoints.is_empty() {
                         self.utxo_by_addr.remove(&addr_bytes)?;
