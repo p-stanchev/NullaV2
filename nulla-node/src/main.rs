@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -19,6 +19,9 @@ use tokio::signal;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
+
+const MAX_INFLIGHT_BLOCK_REQ: usize = 16;
+const HEADER_REQUEST_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum depth for chain reorganizations (SECURITY FIX: HIGH-NEW-002).
 /// Reorgs deeper than 30 blocks are rejected to prevent DoS attacks.
@@ -901,6 +904,7 @@ async fn main() -> Result<()> {
         // Spawn event handler for inbound network events and request/response.
         let cmd_tx = handle.commands.clone();
         let sync_progress = Arc::new(Mutex::new(None::<ProgressBar>));
+        let sync_target_height = Arc::new(AtomicU64::new(0));
         tokio::spawn(handle_network_events(
             handle.events,
             cmd_tx.clone(),
@@ -908,6 +912,7 @@ async fn main() -> Result<()> {
             sync_progress.clone(),
             args.seed,
             chain_id,
+            sync_target_height.clone(),
         ));
 
         // Spawn periodic peer sync task with peer list for reconnection
@@ -933,6 +938,7 @@ async fn main() -> Result<()> {
                 handle.local_peer_id,
                 coinbase_addr,
                 shutdown.clone(),
+                sync_target_height.clone(),
             )?;
         }
 
@@ -1050,6 +1056,7 @@ async fn handle_network_events(
     sync_progress: Arc<Mutex<Option<ProgressBar>>>,
     _seed_mode: bool,
     chain_id: [u8; 4],
+    sync_target_height: Arc<AtomicU64>,
 ) {
     use std::collections::{HashSet, HashMap};
     use nulla_core::OutPoint;
@@ -1061,6 +1068,7 @@ async fn handle_network_events(
     // Track connected peers to avoid duplicate connection log messages
     let mut connected_peers: HashSet<libp2p::PeerId> = HashSet::new();
     let mut inflight_block_requests: usize = 0;
+    let mut last_headers_request: Option<std::time::Instant> = None;
 
     // Orphan block pool: blocks waiting for their parent to arrive
     // Maps block_id -> (block, peer_id)
@@ -1481,6 +1489,7 @@ async fn handle_network_events(
                         cumulative_work: _,
                     } => {
                         sync_target = Some((id, height));
+                        sync_target_height.store(height, Ordering::Relaxed);
                         if missing_scan_cursor.is_none() {
                             missing_scan_cursor = Some(height);
                         }
@@ -1488,6 +1497,14 @@ async fn handle_network_events(
                             db.best_tip().ok().flatten();
                         let local_height = local_tip.as_ref().map(|(_, h, _)| *h).unwrap_or(0);
                         if height > local_height {
+                            let now = std::time::Instant::now();
+                            let can_request = last_headers_request
+                                .map(|t| now.duration_since(t) >= HEADER_REQUEST_COOLDOWN)
+                                .unwrap_or(true);
+                            if !can_request {
+                                break;
+                            }
+                            last_headers_request = Some(now);
                             // GetHeaders walks backwards from the given block
                             // So we pass the PEER'S tip and it returns headers backwards to genesis
                             // We'll process them in reverse order to apply them forward
@@ -1518,7 +1535,7 @@ async fn handle_network_events(
                             if db.get_block(&block_id).ok().flatten().is_none() {
                                 let _ = db.put_header(&header);
                                 debug!("requesting block {} at height {}", hex::encode(block_id), header.height);
-                                if inflight_block_requests >= 64 {
+                                if inflight_block_requests >= MAX_INFLIGHT_BLOCK_REQ {
                                     break;
                                 }
                                 let _ = cmd_tx
@@ -1673,7 +1690,7 @@ async fn retry_missing_blocks(
         if let Ok(Some(header)) = db.get_header_by_height(height) {
             let block_id = nulla_core::block_header_id(&header);
             if db.get_block(&block_id).ok().flatten().is_none() {
-                if *inflight_block_requests >= 64 {
+                if *inflight_block_requests >= MAX_INFLIGHT_BLOCK_REQ {
                     next_cursor = height.checked_sub(1);
                     break;
                 }
@@ -2264,6 +2281,7 @@ fn spawn_miner_real(
     local_peer_id: libp2p::PeerId,
     coinbase_addr: Option<nulla_wallet::Address>,
     shutdown: Arc<AtomicBool>,
+    sync_target_height: Arc<AtomicU64>,
 ) -> Result<()> {
     tokio::spawn(async move {
         info!("miner started (peer_id: {local_peer_id})");
@@ -2280,7 +2298,6 @@ fn spawn_miner_real(
 
         let mut sync_started = false;
         let mut last_height = 0u64;
-        let mut stable_count = 0u8;
 
         // Wait in 1-second intervals so we can check for shutdown
         // 10 minutes = 600 seconds = 10 attempts at 60-second peer dial interval
@@ -2295,25 +2312,27 @@ fn spawn_miner_real(
             if i > 0 && i % 2 == 0 {
                 // Check if we have any blocks from the network
                 if let Ok(Some((_, height, _))) = db.best_tip() {
+                    let target = sync_target_height.load(Ordering::Relaxed);
                     if height > 0 {
                         if !sync_started {
                             info!("miner: peer connected! syncing blocks from network...");
                             sync_started = true;
                             last_height = height;
                         } else {
-                            // Check if sync is progressing or complete
                             if height > last_height {
                                 info!("miner: sync progress - now at height {}", height);
                                 last_height = height;
-                                stable_count = 0; // Reset stability counter
-                            } else if height == last_height {
-                                stable_count += 1;
-                                // If height hasn't changed for 10 seconds (5 checks * 2 seconds), sync is complete
-                                if stable_count >= 5 {
-                                    info!("miner: sync complete at height {}, starting mining!", height);
-                                    break;
-                                }
                             }
+                        }
+
+                        if target > 0 {
+                            if height >= target {
+                                info!("miner: synced to network tip height {}, starting mining", height);
+                                break;
+                            }
+                        } else {
+                            // If no target known, allow mining once we have any chain height.
+                            break;
                         }
                     }
                 }
@@ -2329,15 +2348,27 @@ fn spawn_miner_real(
             info!("miner: no peers connected after 10 minutes, will create genesis block");
         }
 
-        // Check if we have a tip from the network (not genesis)
-        if let Ok(Some((_, height, _))) = db.best_tip() {
-            if height > 0 {
-                info!("miner: synced to height {}, starting mining", height);
-            } else {
-                info!("miner: no network blocks found, will create genesis");
+        let target = sync_target_height.load(Ordering::Relaxed);
+        if target > 0 {
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    info!("miner: shutdown requested during sync wait");
+                    return;
+                }
+                if let Ok(Some((_, height, _))) = db.best_tip() {
+                    if height >= target {
+                        info!("miner: synced to network tip height {}, starting mining", height);
+                        break;
+                    }
+                    if height > 0 {
+                        info!(
+                            "miner: waiting for full sync {}/{} before mining",
+                            height, target
+                        );
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
-        } else {
-            info!("miner: no blocks found, will create genesis");
         }
 
         loop {
@@ -2626,10 +2657,15 @@ fn spawn_miner_real(
             // Broadcast the full block to the network (includes transactions).
             info!("miner: sending PublishFullBlock command for height {} (channel capacity: {}, len: {})",
                 next_height, cmd_tx.capacity().unwrap_or(0), cmd_tx.len());
+            let header = block.header.clone();
             match cmd_tx.send(NetworkCommand::PublishFullBlock { block }).await {
                 Ok(_) => info!("miner: PublishFullBlock command sent successfully (channel len after send: {})", cmd_tx.len()),
                 Err(e) => error!("miner: FAILED to send PublishFullBlock command: {:?}", e),
             }
+            // Also broadcast an inventory header so peers can fall back to GetBlock if needed.
+            let _ = cmd_tx
+                .send(NetworkCommand::PublishBlock { header })
+                .await;
         }
     });
     Ok(())
