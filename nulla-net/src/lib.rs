@@ -494,10 +494,27 @@ async fn run_swarm(
     loop {
         tracing::trace!("loop iteration, cmd_rx len: {}", cmd_rx.len());
 
-        // Use biased select to prioritize command processing over swarm events
-        // This prevents command starvation when swarm events are flooding
+        // CRITICAL: Process ALL pending commands BEFORE handling swarm events
+        // This ensures gossipsub publish commands aren't starved by high-frequency swarm events
+        while let Ok(command) = cmd_rx.try_recv() {
+            let cmd_type = match &command {
+                NetworkCommand::Dial(_) => "Dial",
+                NetworkCommand::PublishTx { .. } => "PublishTx",
+                NetworkCommand::PublishFullTx { .. } => "PublishFullTx",
+                NetworkCommand::PublishBlock { .. } => "PublishBlock",
+                NetworkCommand::PublishFullBlock { block } => {
+                    tracing::warn!("!!! PRE-DRAIN: PublishFullBlock for height {} !!!", block.header.height);
+                    "PublishFullBlock"
+                },
+                NetworkCommand::SendRequest { .. } => "SendRequest",
+                NetworkCommand::SendResponse { .. } => "SendResponse",
+            };
+            tracing::info!("pre-draining {} command (queue len: {})", cmd_type, cmd_rx.len());
+            apply_command(&mut swarm, command, chain_id, &evt_tx).await;
+        }
+
+        // Now process swarm events and wait for new commands
         select! {
-            biased;
             _ = heartbeat_interval.tick() => {
                 let connected_peers = swarm.connected_peers().count();
                 let cmd_queue_len = cmd_rx.len();
@@ -522,42 +539,14 @@ async fn run_swarm(
                             NetworkCommand::PublishFullTx { .. } => "PublishFullTx",
                             NetworkCommand::PublishBlock { .. } => "PublishBlock",
                             NetworkCommand::PublishFullBlock { block } => {
-                                tracing::warn!("!!! NETWORK EVENT LOOP: RECEIVED PublishFullBlock for height {} !!!", block.header.height);
+                                tracing::warn!("!!! RECEIVED: PublishFullBlock for height {} !!!", block.header.height);
                                 "PublishFullBlock"
                             },
                             NetworkCommand::SendRequest { .. } => "SendRequest",
                             NetworkCommand::SendResponse { .. } => "SendResponse",
                         };
-                        tracing::info!("network event loop: received {} command (queue len: {})", cmd_type, cmd_rx.len());
+                        tracing::info!("received {} command (queue len: {})", cmd_type, cmd_rx.len());
                         apply_command(&mut swarm, command, chain_id, &evt_tx).await;
-
-                        // Drain additional commands if queue is backing up (process up to 10 per iteration)
-                        let mut drained = 0;
-                        while drained < 10 {
-                            match cmd_rx.try_recv() {
-                                Ok(cmd) => {
-                                    drained += 1;
-                                    let cmd_type = match &cmd {
-                                        NetworkCommand::Dial(_) => "Dial",
-                                        NetworkCommand::PublishTx { .. } => "PublishTx",
-                                        NetworkCommand::PublishFullTx { .. } => "PublishFullTx",
-                                        NetworkCommand::PublishBlock { .. } => "PublishBlock",
-                                        NetworkCommand::PublishFullBlock { block } => {
-                                            tracing::warn!("!!! DRAINING: PublishFullBlock for height {} !!!", block.header.height);
-                                            "PublishFullBlock"
-                                        },
-                                        NetworkCommand::SendRequest { .. } => "SendRequest",
-                                        NetworkCommand::SendResponse { .. } => "SendResponse",
-                                    };
-                                    tracing::info!("network event loop: draining {} command (queue len: {}, drained: {})", cmd_type, cmd_rx.len(), drained);
-                                    apply_command(&mut swarm, cmd, chain_id, &evt_tx).await;
-                                },
-                                Err(_) => break, // Queue empty
-                            }
-                        }
-                        if drained > 0 {
-                            tracing::info!("drained {} commands from queue", drained);
-                        }
                     },
                     Err(e) => {
                         tracing::warn!("cmd_rx closed: {:?}, exiting loop", e);
