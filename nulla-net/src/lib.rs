@@ -416,6 +416,7 @@ pub async fn spawn_network(config: NetConfig) -> Result<NetworkHandle, NetError>
         .map_err(|e| anyhow::anyhow!("transport error: {e}"))?
         .with_behaviour(move |id| behaviour::build_behaviour(id, &chain_id))
         .map_err(|e| anyhow::anyhow!("behaviour error: {e}"))?
+        .with_swarm_config(|cfg| cfg.with_max_negotiating_inbound_streams(1024))
         .build();
     let peer_id = *swarm.local_peer_id();
     let cover_traffic = config.cover_traffic;

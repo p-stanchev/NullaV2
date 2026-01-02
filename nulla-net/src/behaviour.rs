@@ -72,8 +72,10 @@ pub fn build_behaviour(
         StreamProtocol::new(reqresp::PROTOCOL_NAME),
         request_response::ProtocolSupport::Full,
     ));
+    let request_response_config = request_response::Config::default()
+        .with_max_concurrent_streams(2048);
     let request_response =
-        request_response::Behaviour::new(protocols, request_response::Config::default());
+        request_response::Behaviour::new(protocols, request_response_config);
 
     Ok(Behaviour {
         identify,

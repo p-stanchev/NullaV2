@@ -1502,6 +1502,9 @@ async fn handle_network_events(
                                     })
                                     .await;
                                 requested += 1;
+                                if requested % 16 == 0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                }
                                 if requested >= 128 {
                                     break;
                                 }
