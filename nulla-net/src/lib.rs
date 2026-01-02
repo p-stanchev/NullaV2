@@ -494,9 +494,10 @@ async fn run_swarm(
     loop {
         tracing::trace!("loop iteration, cmd_rx len: {}", cmd_rx.len());
 
-        // tokio::select! fairly distributes processing across all branches,
-        // preventing both command starvation and swarm event starvation
+        // Use biased select to prioritize command processing over swarm events
+        // This prevents command starvation when swarm events are flooding
         select! {
+            biased;
             _ = heartbeat_interval.tick() => {
                 let connected_peers = swarm.connected_peers().count();
                 let cmd_queue_len = cmd_rx.len();
