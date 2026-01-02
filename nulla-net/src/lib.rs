@@ -502,6 +502,9 @@ async fn run_swarm(
                 let connected_peers = swarm.connected_peers().count();
                 let cmd_queue_len = cmd_rx.len();
                 info!("total peers connected: {}, cmd_queue_len: {}", connected_peers, cmd_queue_len);
+                if cmd_queue_len > 0 {
+                    tracing::warn!("!!! HEARTBEAT: cmd_queue has {} items waiting to be processed !!!", cmd_queue_len);
+                }
                 tracing::debug!("heartbeat fired, next in 30s");
             }
             _ = &mut cover_traffic_sleep, if cover_traffic => {
@@ -518,7 +521,10 @@ async fn run_swarm(
                             NetworkCommand::PublishTx { .. } => "PublishTx",
                             NetworkCommand::PublishFullTx { .. } => "PublishFullTx",
                             NetworkCommand::PublishBlock { .. } => "PublishBlock",
-                            NetworkCommand::PublishFullBlock { .. } => "PublishFullBlock",
+                            NetworkCommand::PublishFullBlock { block } => {
+                                tracing::warn!("!!! NETWORK EVENT LOOP: RECEIVED PublishFullBlock for height {} !!!", block.header.height);
+                                "PublishFullBlock"
+                            },
                             NetworkCommand::SendRequest { .. } => "SendRequest",
                             NetworkCommand::SendResponse { .. } => "SendResponse",
                         };
@@ -536,7 +542,10 @@ async fn run_swarm(
                                         NetworkCommand::PublishTx { .. } => "PublishTx",
                                         NetworkCommand::PublishFullTx { .. } => "PublishFullTx",
                                         NetworkCommand::PublishBlock { .. } => "PublishBlock",
-                                        NetworkCommand::PublishFullBlock { .. } => "PublishFullBlock",
+                                        NetworkCommand::PublishFullBlock { block } => {
+                                            tracing::warn!("!!! DRAINING: PublishFullBlock for height {} !!!", block.header.height);
+                                            "PublishFullBlock"
+                                        },
                                         NetworkCommand::SendRequest { .. } => "SendRequest",
                                         NetworkCommand::SendResponse { .. } => "SendResponse",
                                     };
