@@ -1088,6 +1088,12 @@ async fn handle_network_events(
         tokio::select! {
             _ = retry_interval.tick() => {
                 if let Some(peer) = connected_peers.iter().copied().next() {
+                    let _ = cmd_tx
+                        .send(NetworkCommand::SendRequest {
+                            peer,
+                            req: protocol::Req::GetTip,
+                        })
+                        .await;
                     retry_missing_blocks(
                         &db,
                         &cmd_tx,
