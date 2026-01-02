@@ -1060,6 +1060,7 @@ async fn handle_network_events(
 
     // Track connected peers to avoid duplicate connection log messages
     let mut connected_peers: HashSet<libp2p::PeerId> = HashSet::new();
+    let mut inflight_block_requests: usize = 0;
 
     // Orphan block pool: blocks waiting for their parent to arrive
     // Maps block_id -> (block, peer_id)
@@ -1079,7 +1080,14 @@ async fn handle_network_events(
         tokio::select! {
             _ = retry_interval.tick() => {
                 if let Some(peer) = connected_peers.iter().copied().next() {
-                    retry_missing_blocks(&db, &cmd_tx, peer, sync_target, &mut missing_scan_cursor).await;
+                    retry_missing_blocks(
+                        &db,
+                        &cmd_tx,
+                        peer,
+                        sync_target,
+                        &mut missing_scan_cursor,
+                        &mut inflight_block_requests,
+                    ).await;
                 }
             }
             evt = rx.recv() => {
@@ -1510,12 +1518,16 @@ async fn handle_network_events(
                             if db.get_block(&block_id).ok().flatten().is_none() {
                                 let _ = db.put_header(&header);
                                 debug!("requesting block {} at height {}", hex::encode(block_id), header.height);
+                                if inflight_block_requests >= 64 {
+                                    break;
+                                }
                                 let _ = cmd_tx
                                     .send(NetworkCommand::SendRequest {
                                         peer,
                                         req: protocol::Req::GetBlock { id: block_id },
                                     })
                                     .await;
+                                inflight_block_requests += 1;
                                 requested += 1;
                                 if requested % 16 == 0 {
                                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1525,6 +1537,9 @@ async fn handle_network_events(
                         info!("requested {} blocks from {}", requested, peer);
                     }
                     protocol::Resp::Block { block } => {
+                        if inflight_block_requests > 0 {
+                            inflight_block_requests -= 1;
+                        }
                         if let Some(block) = block {
                             let block_id = nulla_core::block_id(&block);
 
@@ -1574,6 +1589,11 @@ async fn handle_network_events(
                             }
                         }
                     }
+                    protocol::Resp::Err { .. } => {
+                        if inflight_block_requests > 0 {
+                            inflight_block_requests -= 1;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1621,6 +1641,7 @@ async fn retry_missing_blocks(
     peer: libp2p::PeerId,
     sync_target: Option<(Hash32, u64)>,
     scan_cursor: &mut Option<u64>,
+    inflight_block_requests: &mut usize,
 ) {
     let Some((_, tip_height, _)) = db.best_tip().ok().flatten() else {
         return;
@@ -1652,12 +1673,17 @@ async fn retry_missing_blocks(
         if let Ok(Some(header)) = db.get_header_by_height(height) {
             let block_id = nulla_core::block_header_id(&header);
             if db.get_block(&block_id).ok().flatten().is_none() {
+                if *inflight_block_requests >= 64 {
+                    next_cursor = height.checked_sub(1);
+                    break;
+                }
                 let _ = cmd_tx
                     .send(NetworkCommand::SendRequest {
                         peer,
                         req: protocol::Req::GetBlock { id: block_id },
                     })
                     .await;
+                *inflight_block_requests += 1;
                 requested += 1;
                 if requested % 16 == 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
