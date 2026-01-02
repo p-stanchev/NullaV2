@@ -11,7 +11,7 @@ use std::{
 use anyhow::Result;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use nulla_core::Hash32;
+use nulla_core::{Block, Hash32};
 use nulla_db::NullaDb;
 use nulla_net::{self, protocol, NetConfig, NetworkCommand, NetworkEvent};
 use nulla_wallet::Wallet;
@@ -2291,6 +2291,73 @@ fn spawn_seed(
     Ok(())
 }
 
+/// Broadcast a newly mined block to the network.
+///
+/// This function handles the complete block broadcasting process:
+/// 1. Publishes the full block via gossipsub (includes all transactions)
+/// 2. Publishes a block inventory header as a fallback for peers that prefer GetBlock
+/// 3. Logs detailed diagnostics about the broadcast status
+///
+/// Returns true if both broadcasts succeeded, false otherwise.
+async fn broadcast_mined_block(
+    cmd_tx: &async_channel::Sender<NetworkCommand>,
+    block: Block,
+) -> bool {
+    let height = block.header.height;
+    let block_id = nulla_core::block_id(&block);
+
+    info!(
+        "broadcasting newly mined block height={} id={} (channel capacity: {}, len: {})",
+        height,
+        hex::encode(block_id),
+        cmd_tx.capacity().unwrap_or(0),
+        cmd_tx.len()
+    );
+
+    let header = block.header.clone();
+
+    // Send PublishFullBlock command
+    let full_block_result = cmd_tx.send(NetworkCommand::PublishFullBlock { block }).await;
+
+    match &full_block_result {
+        Ok(_) => {
+            info!(
+                "PublishFullBlock command sent successfully for height {} (channel len after send: {})",
+                height,
+                cmd_tx.len()
+            );
+        }
+        Err(e) => {
+            error!(
+                "FAILED to send PublishFullBlock command for height {}: {:?}",
+                height, e
+            );
+            return false;
+        }
+    }
+
+    // Also send PublishBlock (inventory header) as a fallback
+    let inv_result = cmd_tx.send(NetworkCommand::PublishBlock { header }).await;
+
+    match &inv_result {
+        Ok(_) => {
+            info!(
+                "PublishBlock (inventory) command sent successfully for height {}",
+                height
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Failed to send PublishBlock inventory for height {}: {:?}",
+                height, e
+            );
+            // Don't return false here - the full block was already sent
+        }
+    }
+
+    true
+}
+
 /// Spawn a miner that builds blocks on top of the chain with proof-of-work.
 ///
 /// Miners:
@@ -2679,18 +2746,10 @@ fn spawn_miner_real(
                 warn!("miner: pruning failed: {e}");
             }
 
-            // Broadcast the full block to the network (includes transactions).
-            info!("miner: sending PublishFullBlock command for height {} (channel capacity: {}, len: {})",
-                next_height, cmd_tx.capacity().unwrap_or(0), cmd_tx.len());
-            let header = block.header.clone();
-            match cmd_tx.send(NetworkCommand::PublishFullBlock { block }).await {
-                Ok(_) => info!("miner: PublishFullBlock command sent successfully (channel len after send: {})", cmd_tx.len()),
-                Err(e) => error!("miner: FAILED to send PublishFullBlock command: {:?}", e),
+            // Broadcast the newly mined block to the network
+            if !broadcast_mined_block(&cmd_tx, block).await {
+                error!("miner: failed to broadcast block at height {}", next_height);
             }
-            // Also broadcast an inventory header so peers can fall back to GetBlock if needed.
-            let _ = cmd_tx
-                .send(NetworkCommand::PublishBlock { header })
-                .await;
         }
     });
     Ok(())

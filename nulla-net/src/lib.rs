@@ -499,7 +499,8 @@ async fn run_swarm(
         select! {
             _ = heartbeat_interval.tick() => {
                 let connected_peers = swarm.connected_peers().count();
-                info!("total peers connected: {}", connected_peers);
+                let cmd_queue_len = cmd_rx.len();
+                info!("total peers connected: {}, cmd_queue_len: {}", connected_peers, cmd_queue_len);
                 tracing::debug!("heartbeat fired, next in 30s");
             }
             _ = &mut cover_traffic_sleep, if cover_traffic => {
@@ -511,7 +512,7 @@ async fn run_swarm(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Ok(command) => {
-                        tracing::debug!("received command from cmd_rx");
+                        tracing::info!("network event loop: received command from cmd_rx (queue len: {})", cmd_rx.len());
                         apply_command(&mut swarm, command, chain_id, &evt_tx).await
                     },
                     Err(e) => {
