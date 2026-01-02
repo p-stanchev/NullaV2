@@ -1072,8 +1072,19 @@ async fn handle_network_events(
     // Would need to track connection manager events to get actual IP addresses
     // For now, rely on libp2p's built-in connection limits
 
-    while let Ok(evt) = rx.recv().await {
-        match evt {
+    let mut retry_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut sync_target: Option<(Hash32, u64)> = None;
+    let mut missing_scan_cursor: Option<u64> = None;
+    loop {
+        tokio::select! {
+            _ = retry_interval.tick() => {
+                if let Some(peer) = connected_peers.iter().copied().next() {
+                    retry_missing_blocks(&db, &cmd_tx, peer, sync_target, &mut missing_scan_cursor).await;
+                }
+            }
+            evt = rx.recv() => {
+                let Ok(evt) = evt else { break };
+                match evt {
             NetworkEvent::TxInv { from, txid } => {
                 info!("inv tx from {from}: {}", hex::encode(txid));
 
@@ -1461,6 +1472,10 @@ async fn handle_network_events(
                         id,
                         cumulative_work: _,
                     } => {
+                        sync_target = Some((id, height));
+                        if missing_scan_cursor.is_none() {
+                            missing_scan_cursor = Some(height);
+                        }
                         let local_tip =
                             db.best_tip().ok().flatten();
                         let local_height = local_tip.as_ref().map(|(_, h, _)| *h).unwrap_or(0);
@@ -1504,9 +1519,6 @@ async fn handle_network_events(
                                 requested += 1;
                                 if requested % 16 == 0 {
                                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                                }
-                                if requested >= 128 {
-                                    break;
                                 }
                             }
                         }
@@ -1597,7 +1609,78 @@ async fn handle_network_events(
             NetworkEvent::BroadcastFailed { reason } => {
                 warn!("broadcast failed: {}", reason);
             }
+                }
+            }
         }
+    }
+}
+
+async fn retry_missing_blocks(
+    db: &NullaDb,
+    cmd_tx: &async_channel::Sender<NetworkCommand>,
+    peer: libp2p::PeerId,
+    sync_target: Option<(Hash32, u64)>,
+    scan_cursor: &mut Option<u64>,
+) {
+    let Some((_, tip_height, _)) = db.best_tip().ok().flatten() else {
+        return;
+    };
+
+    if let Some((target_id, target_height)) = sync_target {
+        if tip_height < target_height {
+            let _ = cmd_tx
+                .send(NetworkCommand::SendRequest {
+                    peer,
+                    req: protocol::Req::GetHeaders {
+                        from: target_id,
+                        limit: protocol::MAX_HEADERS as u32,
+                    },
+                })
+                .await;
+        }
+    }
+
+    let max_height = sync_target.map(|(_, h)| h).unwrap_or(tip_height);
+    let start_height = scan_cursor.unwrap_or(max_height).min(max_height);
+    let mut requested = 0usize;
+    let mut scanned = 0usize;
+    let max_scan_steps = 4096usize;
+
+    let mut next_cursor = None;
+    for height in (0..=start_height).rev() {
+        scanned += 1;
+        if let Ok(Some(header)) = db.get_header_by_height(height) {
+            let block_id = nulla_core::block_header_id(&header);
+            if db.get_block(&block_id).ok().flatten().is_none() {
+                let _ = cmd_tx
+                    .send(NetworkCommand::SendRequest {
+                        peer,
+                        req: protocol::Req::GetBlock { id: block_id },
+                    })
+                    .await;
+                requested += 1;
+                if requested % 16 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                if requested >= 256 {
+                    next_cursor = height.checked_sub(1);
+                    break;
+                }
+            }
+        }
+        if scanned >= max_scan_steps {
+            next_cursor = height.checked_sub(1);
+            break;
+        }
+    }
+
+    if next_cursor.is_none() && start_height > 0 {
+        next_cursor = start_height.checked_sub(1);
+    }
+    *scan_cursor = next_cursor;
+
+    if requested > 0 {
+        info!("retry requested {} missing blocks from {}", requested, peer);
     }
 }
 
